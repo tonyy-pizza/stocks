@@ -498,6 +498,66 @@ def get_price_history(ticker: str,
                         force_refresh=force_refresh)
 
 
+def download_prices(tickers,
+                    period: str = "1y",
+                    interval: str = "1d",
+                    ttl: float = TTL_PRICE,
+                    chunk_size: int = 100,
+                    cache_key: Optional[str] = None,
+                    force_refresh: bool = False) -> dict:
+    """Batched close-price download for many tickers at once.
+
+    One yf.download() call per chunk instead of one request per ticker - the
+    difference between minutes and hours for a few hundred names. Chunks are
+    cached separately under cache\\prices\\, so a re-run with the same
+    shortlist costs nothing.
+
+    Returns {TICKER: [{"date": "YYYY-MM-DD", "close": float}, ...]} holding
+    only the tickers Yahoo actually returned. Dates are day-resolution so
+    listings on different exchanges line up on a shared calendar.
+    """
+    symbols = sorted({str(t).strip().upper() for t in (tickers or []) if str(t).strip()})
+    if not symbols:
+        return {}
+
+    out: dict = {}
+    for start in range(0, len(symbols), max(1, chunk_size)):
+        chunk = symbols[start:start + max(1, chunk_size)]
+        digest = hashlib.md5(",".join(chunk).encode("utf-8")).hexdigest()[:10]
+        key = f"{cache_key or 'batch'}_{period}_{interval}_{digest}"
+
+        def _pull(chunk=chunk):
+            frame = yf.download(chunk, period=period, interval=interval,
+                                auto_adjust=True, progress=False,
+                                group_by="column", threads=True,
+                                session=get_session())
+            if frame is None or frame.empty:
+                raise ValueError(f"empty download for {len(chunk)} tickers ({period})")
+            closes = frame["Close"] if "Close" in frame.columns.get_level_values(0) else None
+            if closes is None or closes.empty:
+                raise ValueError(f"no Close column for {len(chunk)} tickers ({period})")
+            dates = [d.strftime("%Y-%m-%d") for d in closes.index]
+            payload = {}
+            for symbol in closes.columns:
+                rows = [{"date": date, "close": float(value)}
+                        for date, value in zip(dates, closes[symbol].tolist())
+                        if value is not None and not (isinstance(value, float) and math.isnan(value))]
+                if rows:
+                    payload[str(symbol).upper()] = rows
+            if not payload:
+                raise ValueError(f"no usable closes for {len(chunk)} tickers ({period})")
+            return payload
+
+        result = cached_fetch(key, lambda: fetch_with_backoff(_pull), ttl,
+                              cache_type="prices", force_refresh=force_refresh)
+        if result:
+            out.update(result)
+        else:
+            _warn(f"price chunk failed for {len(chunk)} tickers ({chunk[0]}..{chunk[-1]})")
+
+    return out
+
+
 def get_avg_volume(ticker: str,
                    info: Optional[dict] = None,
                    period: str = "3mo") -> Optional[float]:
