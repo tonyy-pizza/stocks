@@ -327,6 +327,15 @@ def was_cache_hit() -> Optional[bool]:
     return LAST_CACHE_HIT
 
 
+def cache_timestamp(cache_key: str, cache_type: Optional[str] = None) -> Optional[str]:
+    """ISO timestamp of when a cache entry was actually fetched, or None if
+    there is no entry. Callers that report data freshness ("financials as of
+    ...") need the fetch time, not the time they happened to read the file.
+    """
+    entry = _read_cache_entry(cache_path(cache_key, cache_type))
+    return entry.get("timestamp") if entry else None
+
+
 def clear_cache(cache_key: Optional[str] = None, cache_type: Optional[str] = None) -> int:
     """Delete one cache file, or a whole type's folder, or everything.
     Returns the number of files removed."""

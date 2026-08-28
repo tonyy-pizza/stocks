@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 """
-Stock Investment Evaluator v5.3 — Compact Risk-Adjusted Edition
+Stock Investment Evaluator v5.4 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
+
+v5.4 changes vs v5.3 (all additive — the scoring math is untouched):
+- Adds batch mode: evaluate_universe() scores the candidate universe that
+  universe_screen.py writes, and writes data/scored_candidates.json plus a
+  list of the tickers it had to skip and why. One bad ticker never stops the
+  run. Reached from the CLI with --batch; plain `stock_evaluator.py TICKER`
+  is unchanged.
+- Batch fetches route through market_data.py (shared session, disk cache,
+  exponential backoff) instead of raw yfinance, and rebuild the same pandas
+  frames, so calc_metrics/piotroski/altman_z/magic_formula run as they are.
+- Adds trend_analysis(): the year-over-year checks (ROA improving, debt
+  decreasing) extended across every annual period Yahoo returns, reported as
+  trend_years_available / roa_trend_consistent / fcf_positive_years /
+  debt_trend. Under two years these read "insufficient history".
+- Adds liquidity_check(): what share of average daily dollar volume one
+  position would be, given an account size. Flags, never excludes.
+- Adds divergence_pattern(): price_disconnect (price low, trend intact) vs
+  trend_confirms_decline (price low, trend rolling over) vs neutral.
+- Records financials_as_of and price_as_of per ticker: info is cached on the
+  1-day price TTL, statements on the 7-day fundamentals TTL, so the two
+  timestamps legitimately differ.
 
 v5.3 changes vs v5.2:
 - Adds value_screen(): a 52-week-low value flag. When a stock trades in the
@@ -34,7 +55,9 @@ v4 changes vs v3:
 - CLI mode: python stock_evaluator.py TICKER
 
 Setup: pip install yfinance
-Usage: python stock_evaluator.py [TICKER [TICKER ...]]
+Usage: python stock_evaluator.py [TICKER [TICKER ...]]   # single-ticker, unchanged
+       python stock_evaluator.py --batch                 # score data/candidates.json
+       python stock_evaluator.py --batch --account-size 25000
 """
 
 import math, os, sys
@@ -833,6 +856,697 @@ def print_diversification_summary(results):
         print(f"  {G}Sector spread looks reasonably diversified.{X}")
     rule(); print()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH MODE  (v5.4)
+#
+# Everything below this line is additive. The single-ticker path above is
+# untouched: it still calls get_data() and yfinance directly, and
+# `py stock_evaluator.py TICKER` behaves exactly as it did.
+#
+# Batch mode instead routes every fetch through market_data.py, so a scan of
+# a few thousand candidates reuses one session, hits the disk cache, and
+# retries with backoff. The cached fetches rebuild the same pandas frames
+# get_data() returns, so calc_metrics(), piotroski(), altman_z(),
+# magic_formula() and dcf_scenarios() run unchanged on cached data.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import json
+from pathlib import Path
+
+# market_data.py sits next to this script on the working machine
+# (C:\Users\joey\stocks\), and in stocks/ when this repo is checked out.
+def _import_market_data():
+    here = Path(__file__).resolve().parent
+    for candidate in (here, here.parent / "stocks", here.parent):
+        if (candidate / "market_data.py").exists():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
+    import market_data
+    return market_data
+
+try:
+    md = _import_market_data()
+except Exception as _md_err:      # single-ticker mode must not care
+    md = None
+    _MD_IMPORT_ERROR = _md_err
+else:
+    _MD_IMPORT_ERROR = None
+
+# Liquidity gate defaults: a 3% position that eats more than 1% of a day's
+# dollar volume is worth flagging, not excluding.
+DEFAULT_POSITION_PCT = 0.03
+DEFAULT_MAX_ADV_PCT  = 0.01
+
+# "Bottom of the 52-week range" for the divergence check.
+DIVERGENCE_LOW_POS = 0.25
+
+INSUFFICIENT = "insufficient history"
+
+
+def data_dir():
+    """<stocks>\\data — the same directory universe_screen.py writes to."""
+    override = os.environ.get("STOCKS_DATA_DIR")
+    if override:
+        return Path(override)
+    base = Path(md.BASE_DIR) if md is not None else Path(__file__).resolve().parent
+    return base / "data"
+
+
+def _require_market_data():
+    if md is None:
+        raise RuntimeError(
+            "batch mode needs market_data.py next to this script "
+            f"(import failed: {_MD_IMPORT_ERROR})")
+
+
+# ─── CACHED FETCH (frames in, frames out) ──────────────────────────────────
+def _frame_to_payload(df):
+    """DataFrame -> JSON-safe dict. None for an empty/missing statement."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    columns = [c.isoformat() if hasattr(c, "isoformat") else str(c) for c in df.columns]
+    rows = []
+    for _, row in df.iterrows():
+        rows.append([num(v) for v in row.tolist()])
+    return {"index": [str(i) for i in df.index], "columns": columns, "data": rows}
+
+
+def _payload_to_frame(payload):
+    """Rebuild the frame get_data() would have handed to calc_metrics().
+
+    Columns come back as Timestamps so the stale-statement check
+    (fin.columns[0].to_pydatetime()) keeps working.
+    """
+    if not payload:
+        return None
+    import pandas as pd
+    columns = pd.to_datetime(payload["columns"], errors="coerce")
+    if columns.isna().all():
+        columns = payload["columns"]
+    return pd.DataFrame(payload["data"], index=payload["index"], columns=columns)
+
+
+def _history_frame(rows):
+    """market_data price rows -> the OHLCV frame calc_metrics() expects."""
+    if not rows:
+        return None
+    import pandas as pd
+    index = pd.to_datetime([r.get("date") for r in rows], errors="coerce", utc=True)
+    return pd.DataFrame({
+        "Open":   [r.get("open") for r in rows],
+        "High":   [r.get("high") for r in rows],
+        "Low":    [r.get("low") for r in rows],
+        "Close":  [r.get("close") for r in rows],
+        "Volume": [r.get("volume") for r in rows],
+    }, index=index)
+
+
+def fetch_statements(ticker, ttl=None, force_refresh=False):
+    """Annual income statement / balance sheet / cash flow, cached 7 days.
+
+    One cache entry per ticker holding all three, so a ticker costs one
+    request instead of three.
+    """
+    _require_market_data()
+    ttl = md.TTL_FINANCIALS if ttl is None else ttl
+
+    def _pull():
+        t = md.get_ticker(ticker)
+        payload = {"fin": _frame_to_payload(t.financials),
+                   "bal": _frame_to_payload(t.balance_sheet),
+                   "cf":  _frame_to_payload(t.cashflow)}
+        if all(v is None for v in payload.values()):
+            raise ValueError(f"no annual statements returned for {ticker}")
+        return payload
+
+    return md.cached_fetch(f"{ticker}_statements",
+                           lambda: md.fetch_with_backoff(_pull),
+                           ttl, cache_type="financials", force_refresh=force_refresh)
+
+
+def fetch_insider(ticker, ttl=None, force_refresh=False):
+    """Form-4 summary table. Optional and noisy - failure is not an error."""
+    _require_market_data()
+    ttl = md.TTL_FINANCIALS if ttl is None else ttl
+
+    def _pull():
+        table = md.get_ticker(ticker).insider_purchases
+        payload = _frame_to_payload(table)
+        if payload is None:
+            raise ValueError(f"no insider table for {ticker}")
+        return payload
+
+    return md.cached_fetch(f"{ticker}_insider",
+                           lambda: md.fetch_with_backoff(_pull, max_retries=2),
+                           ttl, cache_type="financials", force_refresh=force_refresh)
+
+
+def get_data_cached(ticker, include_insider=False, force_refresh=False):
+    """get_data() for batch mode: same dict shape, fetched through market_data.
+
+    info carries the live price and the 52-week range, so it is cached on the
+    price TTL (1 day) rather than the fundamentals TTL (7 days) - that is why
+    financials_as_of and price_as_of can differ.
+
+    Returns (data, None) or (None, reason). Never raises for a fetch failure.
+    """
+    _require_market_data()
+
+    info = md.get_info(ticker, ttl=md.TTL_PRICE, force_refresh=force_refresh)
+    if not isinstance(info, dict) or not info:
+        return None, "info unavailable after retries"
+    if info.get("quoteType") is None or info.get("shortName") is None:
+        return None, "ticker not found (no quoteType/shortName)"
+
+    statements = fetch_statements(ticker, force_refresh=force_refresh)
+    if not statements:
+        return None, "annual statements unavailable after retries"
+
+    insider = None
+    if include_insider:
+        payload = fetch_insider(ticker, force_refresh=force_refresh)
+        insider = _payload_to_frame(payload) if payload else None
+
+    history = _history_frame(md.get_price_history(ticker, period="1y"))
+
+    return {
+        "ticker": ticker.upper(),
+        "info": info,
+        "fin": _payload_to_frame(statements.get("fin")),
+        "bal": _payload_to_frame(statements.get("bal")),
+        "cf":  _payload_to_frame(statements.get("cf")),
+        "hist": history,
+        "insider_purchases": insider,
+        # When each input was actually fetched, read off the cache entries.
+        "financials_as_of": md.cache_timestamp(f"{ticker}_statements", "financials"),
+        "price_as_of": md.cache_timestamp(f"{ticker}_info", "financials"),
+    }, None
+
+
+# ─── MULTI-YEAR TRENDS (v5.4) ──────────────────────────────────────────────
+def _n_periods(df):
+    try:
+        return 0 if df is None or df.empty else len(df.columns)
+    except Exception:
+        return 0
+
+
+def trend_analysis(d):
+    """Multi-year view of the signals Piotroski only checks year-over-year.
+
+    Piotroski asks "is ROA better than last year". This asks "has ROA held up
+    across every year Yahoo returned" - typically four, sometimes two, and for
+    a recent IPO sometimes one. Below two years nothing is computed: a
+    one-point trend is not a trend, and reporting one would be misleading.
+
+    Returns the four fields plus the underlying series, oldest year first.
+    """
+    fin, bal, cf = d.get("fin"), d.get("bal"), d.get("cf")
+
+    # Widest statement wins: rv() returns None past a narrower frame's end.
+    # Yahoo pads the oldest column with an all-empty period, so the column
+    # count is not the number of years of data - see the trim below.
+    counts = [n for n in (_n_periods(fin), _n_periods(bal), _n_periods(cf)) if n]
+    periods = max(counts) if counts else 0
+
+    # yfinance returns newest-first; reverse everything to oldest-first.
+    roa_series, fcf_series, debt_series = [], [], []
+    for i in reversed(range(periods)):
+        ni = rv(fin, "Net Income", i)
+        ta = rv(bal, "Total Assets", i)
+        roa_series.append(sd(ni, ta))
+
+        fcf = rv(cf, "Free Cash Flow", i)
+        if fcf is None:
+            ocf = rf(cf, ["Operating Cash Flow", "Total Cash From Operating Activities",
+                          "Cash Flow From Continuing Operating Activities"], i)
+            capex = rf(cf, ["Capital Expenditure", "Capital Expenditures"], i)
+            if ocf is not None and capex is not None:
+                fcf = ocf + capex        # capex is reported negative
+        fcf_series.append(fcf)
+
+        debt_series.append(rf(bal, ["Total Debt", "Long Term Debt"], i))
+
+    # Drop periods that carry no data at all - an empty padding column is not
+    # a year of history, and counting it would understate every "N of M".
+    keep = [i for i in range(periods)
+            if any(s[i] is not None for s in (roa_series, fcf_series, debt_series))]
+    roa_series = [roa_series[i] for i in keep]
+    fcf_series = [fcf_series[i] for i in keep]
+    debt_series = [debt_series[i] for i in keep]
+    years = len(keep)
+
+    if years < 2:
+        return {
+            "trend_years_available": years,
+            "roa_trend_consistent": INSUFFICIENT,
+            "fcf_positive_years": INSUFFICIENT,
+            "debt_trend": INSUFFICIENT,
+            "trend_detail": {"roa_by_year": [], "fcf_by_year": [], "debt_by_year": [],
+                             "note": "fewer than 2 annual periods with data"},
+        }
+
+    roa_valid = [v for v in roa_series if v is not None]
+    fcf_valid = [v for v in fcf_series if v is not None]
+    debt_valid = [v for v in debt_series if v is not None]
+
+    if len(roa_valid) >= 2:
+        roa_consistent = all(b >= a for a, b in zip(roa_valid, roa_valid[1:]))
+    else:
+        roa_consistent = INSUFFICIENT
+
+    fcf_positive = len([v for v in fcf_valid if v > 0]) if fcf_valid else INSUFFICIENT
+
+    if len(debt_valid) >= 2:
+        first, last = debt_valid[0], debt_valid[-1]
+        change = sd(last - first, abs(first))
+        if change is None:
+            debt_trend = "flat" if last == first else "unavailable"
+        elif change < -0.05:
+            debt_trend = "decreasing"
+        elif change > 0.05:
+            debt_trend = "increasing"
+        else:
+            debt_trend = "flat"
+    else:
+        debt_trend = INSUFFICIENT
+
+    def _round(values):
+        return [None if v is None else round(v, 6) for v in values]
+
+    return {
+        "trend_years_available": years,
+        "roa_trend_consistent": roa_consistent,
+        "fcf_positive_years": fcf_positive,
+        "debt_trend": debt_trend,
+        "trend_detail": {
+            "roa_by_year": _round(roa_series),
+            "fcf_by_year": _round(fcf_series),
+            "debt_by_year": _round(debt_series),
+            # Per-series counts: a series can be shorter than the window when
+            # Yahoo omits a line item, so "N of M" is stated per series.
+            "roa_years_available": len(roa_valid),
+            "fcf_years_available": len(fcf_valid),
+            "debt_years_available": len(debt_valid),
+            "order": "oldest to newest",
+        },
+    }
+
+
+# ─── LIQUIDITY GATE (v5.4) ─────────────────────────────────────────────────
+def liquidity_check(m, account_size=None,
+                    position_pct=DEFAULT_POSITION_PCT,
+                    max_adv_pct=DEFAULT_MAX_ADV_PCT,
+                    account_currency=None,
+                    avg_volume_hint=None):
+    """How much of a normal trading day one position would be.
+
+    A flag, never an exclusion: thin names stay in the scan and are marked so
+    the reason is visible downstream instead of silently disappearing.
+
+    Dollar volume is in the stock's own quote currency. When that differs from
+    the account currency the comparison is not FX-adjusted, and says so.
+    """
+    result = {"evaluated": False, "account_size": account_size,
+              "position_pct": position_pct, "max_adv_pct": max_adv_pct}
+
+    if not account_size or account_size <= 0:
+        result["note"] = "no account size supplied; liquidity not evaluated"
+        return False, result
+
+    price = num(m.get("price"))
+    volume = num(m.get("avg_volume")) or num(avg_volume_hint)
+    if not price or not volume:
+        result["note"] = "price or average volume unavailable"
+        return False, result
+
+    adv_value = price * volume
+    position_value = account_size * position_pct
+    share = sd(position_value, adv_value)
+    if share is None:
+        result["note"] = "average daily dollar volume is zero"
+        return False, result
+
+    result.update({
+        "evaluated": True,
+        "avg_daily_dollar_volume": round(adv_value, 2),
+        "position_value": round(position_value, 2),
+        "position_pct_of_adv": round(share, 6),
+        "quote_currency": m.get("quote_currency"),
+    })
+    if account_currency and m.get("quote_currency") and account_currency != m.get("quote_currency"):
+        result["fx_note"] = (f"dollar volume in {m['quote_currency']}, account in "
+                             f"{account_currency}; not FX-adjusted")
+
+    return bool(share > max_adv_pct), result
+
+
+# ─── PRICE / FUNDAMENTALS DIVERGENCE (v5.4) ────────────────────────────────
+def divergence_pattern(m, trend, low_pos=DIVERGENCE_LOW_POS):
+    """Is a beaten-down price contradicted or confirmed by the trend data?
+
+    Only meaningful near the bottom of the 52-week range. There the question
+    is whether the multi-year fundamentals agree with the price:
+
+      price_disconnect       - price low, nothing deteriorating (out of favour)
+      trend_confirms_decline - price low and the trend is rolling over (trap)
+      neutral                - mixed signals, or price is not near its low
+    """
+    pos = num(m.get("pos_52w"))
+    detail = {"pos_52w": pos, "low_threshold": low_pos, "deterioration": []}
+
+    if pos is None:
+        detail["reason"] = "52-week position unavailable"
+        return "neutral", detail
+    if pos > low_pos:
+        detail["reason"] = "price is not in the bottom of its 52-week range"
+        return "neutral", detail
+
+    deterioration = detail["deterioration"]
+    holding_up = detail["holding_up"] = []
+
+    if trend.get("roa_trend_consistent") is False:
+        deterioration.append("ROA not holding up across available years")
+    elif trend.get("roa_trend_consistent") is True:
+        holding_up.append("ROA non-decreasing across available years")
+
+    if isinstance(trend.get("fcf_positive_years"), int):
+        fcf_years = (trend.get("trend_detail") or {}).get("fcf_years_available") or 0
+        if fcf_years and trend["fcf_positive_years"] * 2 <= fcf_years:
+            deterioration.append(
+                f"FCF positive in only {trend['fcf_positive_years']} of {fcf_years} years")
+        elif fcf_years:
+            holding_up.append(
+                f"FCF positive in {trend['fcf_positive_years']} of {fcf_years} years")
+
+    if trend.get("debt_trend") == "increasing":
+        deterioration.append("debt rising over the full window")
+    elif trend.get("debt_trend") in ("decreasing", "flat"):
+        holding_up.append(f"debt {trend['debt_trend']} over the full window")
+
+    rev_growth = num(m.get("rev_growth_raw"))
+    if rev_growth is not None:
+        (deterioration if rev_growth < 0 else holding_up).append(
+            f"revenue {'declining' if rev_growth < 0 else 'growing'} year over year")
+    ni_growth = num(m.get("ni_growth"))
+    if ni_growth is not None:
+        (deterioration if ni_growth < 0 else holding_up).append(
+            f"net income {'declining' if ni_growth < 0 else 'growing'} year over year")
+
+    if len(deterioration) >= 2:
+        return "trend_confirms_decline", detail
+    if not deterioration and holding_up:
+        return "price_disconnect", detail
+
+    # No deterioration but nothing holding up either: a recent IPO with no
+    # usable history is not evidence that the business is fine.
+    detail["reason"] = ("one deterioration signal only; neither pattern is clear"
+                        if deterioration else
+                        "no usable trend data to confirm the price move")
+    return "neutral", detail
+
+
+# ─── SCORING ONE CANDIDATE ─────────────────────────────────────────────────
+def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT,
+                    max_adv_pct=DEFAULT_MAX_ADV_PCT, account_currency=None,
+                    avg_volume_hint=None, include_insider=False, force_refresh=False):
+    """Run one ticker through the existing pipeline, quietly.
+
+    Same calls evaluate() makes, minus print_report(), plus the v5.4 fields.
+    Returns (record, None) or (None, reason) - it never raises for bad data.
+    """
+    try:
+        data, reason = get_data_cached(ticker, include_insider=include_insider,
+                                       force_refresh=force_refresh)
+        if data is None:
+            return None, reason
+
+        m = calc_metrics(data)
+        # Average volume for the liquidity gate: prefer the info payload (same
+        # 1-day cache as the price), fall back to the screener's figure.
+        m["avg_volume"] = (num(data["info"].get("averageDailyVolume3Month"))
+                           or num(data["info"].get("averageVolume"))
+                           or num(avg_volume_hint))
+        pio = piotroski(data)
+        alt = altman_z(data)
+        gra = graham_number(m)
+        mag = magic_formula(data, m)
+        ins = insider_conviction(data) if include_insider else None
+        dc = dcf_scenarios(data, m)
+        sc = build_scores(m, pio, alt, gra, mag, dc)
+        pos = position_guidance(m, sc, ins)
+        vs = value_screen(m, sc["dims"])
+
+        trend = trend_analysis(data)
+        liquidity_flag, liquidity = liquidity_check(
+            m, account_size=account_size, position_pct=position_pct,
+            max_adv_pct=max_adv_pct, account_currency=account_currency,
+            avg_volume_hint=avg_volume_hint)
+        pattern, divergence = divergence_pattern(m, trend)
+
+        if liquidity_flag:
+            m["warnings"].append(
+                f"Thin liquidity: a {position_pct*100:.0f}% position would be "
+                f"{liquidity['position_pct_of_adv']*100:.2f}% of average daily dollar "
+                f"volume (flag above {max_adv_pct*100:.0f}%).")
+        if pattern == "trend_confirms_decline":
+            m["warnings"].append(
+                "Value-trap pattern: price near its 52-week low AND the multi-year "
+                "trend is deteriorating - higher risk.")
+
+        record = {
+            "ticker": data["ticker"],
+            "name": m.get("name"),
+            "sector": m.get("sector"),
+            "industry": m.get("industry"),
+            "quote_currency": m.get("quote_currency"),
+            "composite": sc["composite"],
+            "rating": sc["rating"],
+            "dims": sc["dims"],
+            "metrics": m,
+            "frameworks": {"piotroski": pio, "altman_z": alt, "graham": gra,
+                           "magic_formula": mag, "dcf": dc},
+            "position_guidance": pos,
+            "value_screen": vs,
+            "insider": ins,
+            # v5.4 additions
+            "trend_years_available": trend["trend_years_available"],
+            "roa_trend_consistent": trend["roa_trend_consistent"],
+            "fcf_positive_years": trend["fcf_positive_years"],
+            "debt_trend": trend["debt_trend"],
+            "trend_detail": trend["trend_detail"],
+            "liquidity_flag": liquidity_flag,
+            "liquidity": liquidity,
+            "divergence_pattern": pattern,
+            "divergence_detail": divergence,
+            "financials_as_of": data.get("financials_as_of"),
+            "price_as_of": data.get("price_as_of"),
+            "warnings": m.get("warnings", []),
+            "notes": m.get("notes", []),
+        }
+        return record, None
+    except Exception as e:
+        # One malformed ticker must never take the batch down with it.
+        return None, f"{type(e).__name__}: {e}"
+
+
+# ─── BATCH RUN ─────────────────────────────────────────────────────────────
+def _json_default(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    item = getattr(o, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(o)
+
+
+def _write_json(document, output_path):
+    """Atomic write, so a reader never sees a half-written scan."""
+    import tempfile
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(document, f, indent=2, ensure_ascii=False, default=_json_default)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return output_path
+
+
+def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
+                      position_pct=DEFAULT_POSITION_PCT, max_adv_pct=DEFAULT_MAX_ADV_PCT,
+                      account_currency="USD", limit=None, sectors=None,
+                      include_insider=False, force_refresh=False, quiet=False):
+    """Score every candidate from Stage 0 into data\\scored_candidates.json.
+
+    Reads the candidates.json universe_screen.py writes, runs each ticker
+    through the existing scoring pipeline over market_data's cache, and
+    writes every successful record plus a "skipped" list of the tickers that
+    failed and why. A ticker that cannot be fetched or scored is logged and
+    stepped over - the batch always finishes.
+    """
+    _require_market_data()
+
+    candidates_path = Path(candidates_path) if candidates_path else data_dir() / "candidates.json"
+    output_path = Path(output_path) if output_path else data_dir() / "scored_candidates.json"
+
+    with open(candidates_path, "r", encoding="utf-8") as f:
+        universe = json.load(f)
+    candidates = universe.get("candidates") or []
+
+    if sectors:
+        wanted = {s.strip().lower() for s in sectors}
+        candidates = [c for c in candidates if (c.get("sector") or "").lower() in wanted]
+    if limit:
+        candidates = candidates[:limit]
+
+    scored, skipped = [], []
+    total = len(candidates)
+    started = datetime.now()
+
+    if not quiet:
+        print(f"\n  {B}{C}Batch scoring {total} candidate(s){X}")
+        print(f"  source: {candidates_path}")
+        if account_size:
+            print(f"  liquidity gate: {position_pct*100:.0f}% of "
+                  f"{account_size:,.0f} {account_currency}, flag above "
+                  f"{max_adv_pct*100:.0f}% of average daily dollar volume")
+        print()
+
+    for i, candidate in enumerate(candidates, 1):
+        ticker = str(candidate.get("ticker") or "").strip().upper()
+        if not ticker:
+            skipped.append({"ticker": None, "reason": "candidate row has no ticker"})
+            continue
+
+        record, reason = score_candidate(
+            ticker,
+            account_size=account_size, position_pct=position_pct,
+            max_adv_pct=max_adv_pct, account_currency=account_currency,
+            avg_volume_hint=candidate.get("avg_volume"),
+            include_insider=include_insider, force_refresh=force_refresh)
+
+        if record is None:
+            skipped.append({"ticker": ticker, "reason": reason})
+            if not quiet:
+                print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
+            continue
+
+        scored.append(record)
+        if not quiet:
+            flags = []
+            if record["liquidity_flag"]:
+                flags.append("thin")
+            if record["divergence_pattern"] != "neutral":
+                flags.append(record["divergence_pattern"])
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            print(f"  [{i:>4}/{total}] {ticker:<10} {colour(record['composite'])} / 10{suffix}")
+
+    document = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source": str(candidates_path),
+        "params": {
+            "account_size": account_size,
+            "account_currency": account_currency,
+            "position_pct": position_pct,
+            "max_adv_pct": max_adv_pct,
+            "divergence_low_pos": DIVERGENCE_LOW_POS,
+            "sectors": sorted(sectors) if sectors else None,
+            "limit": limit,
+            "include_insider": include_insider,
+            "evaluator_version": "5.4",
+        },
+        "counts": {"candidates": total, "scored": len(scored), "skipped": len(skipped)},
+        "scored": scored,
+        "skipped": skipped,
+    }
+    _write_json(document, output_path)
+
+    if not quiet:
+        elapsed = (datetime.now() - started).total_seconds()
+        print(f"\n  {B}scored:{X}  {len(scored)}")
+        print(f"  {B}skipped:{X} {len(skipped)}")
+        if scored:
+            flagged = sum(1 for r in scored if r["liquidity_flag"])
+            traps = sum(1 for r in scored if r["divergence_pattern"] == "trend_confirms_decline")
+            disconnects = sum(1 for r in scored if r["divergence_pattern"] == "price_disconnect")
+            thin_trend = sum(1 for r in scored if r["trend_years_available"] < 2)
+            print(f"  liquidity flags: {flagged}  ·  price_disconnect: {disconnects}  "
+                  f"·  trend_confirms_decline: {traps}")
+            print(f"  insufficient trend history: {thin_trend}")
+        print(f"  {B}wrote:{X}   {output_path}  ({elapsed:.0f}s)\n")
+
+    return document
+
+
+def batch_main(argv):
+    """CLI for batch mode. Reached only when a flag is passed, so the plain
+    `py stock_evaluator.py TICKER [TICKER ...]` path never comes through here."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="stock_evaluator.py",
+        description="Batch-score the Stage 0 candidate universe "
+                    "(no flags = the original single-ticker mode).")
+    parser.add_argument("--batch", "--universe", action="store_true", dest="batch",
+                        help="score every candidate from candidates.json")
+    parser.add_argument("--candidates", metavar="PATH",
+                        help="input universe (default: <stocks>/data/candidates.json)")
+    parser.add_argument("--output", metavar="PATH",
+                        help="output file (default: <stocks>/data/scored_candidates.json)")
+    parser.add_argument("--account-size", type=float, metavar="AMOUNT",
+                        help="account size for the liquidity gate; omitted = gate off")
+    parser.add_argument("--account-currency", default="USD",
+                        help="currency the account size is in (default USD)")
+    parser.add_argument("--position-pct", type=float, default=DEFAULT_POSITION_PCT,
+                        metavar="FRACTION",
+                        help=f"hypothetical position as a fraction of the account "
+                             f"(default {DEFAULT_POSITION_PCT})")
+    parser.add_argument("--max-adv-pct", type=float, default=DEFAULT_MAX_ADV_PCT,
+                        metavar="FRACTION",
+                        help=f"flag above this share of average daily dollar volume "
+                             f"(default {DEFAULT_MAX_ADV_PCT})")
+    parser.add_argument("--sector", action="append", dest="sectors", metavar="NAME",
+                        help="only score this sector (repeatable)")
+    parser.add_argument("--limit", type=int, help="score only the first N candidates")
+    parser.add_argument("--insider", action="store_true",
+                        help="also pull insider transactions (one extra request per ticker)")
+    parser.add_argument("--refresh", action="store_true", help="ignore cached data and refetch")
+    parser.add_argument("--quiet", action="store_true", help="only print the summary")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="market_data cache/retry trace")
+    args = parser.parse_args(argv)
+
+    if md is None:
+        print(f"\n  {R}Batch mode needs market_data.py next to this script.{X}")
+        print(f"  Import failed: {_MD_IMPORT_ERROR}\n")
+        return 2
+    if args.verbose:
+        md.DEBUG = True
+
+    try:
+        evaluate_universe(candidates_path=args.candidates, output_path=args.output,
+                          account_size=args.account_size, position_pct=args.position_pct,
+                          max_adv_pct=args.max_adv_pct, account_currency=args.account_currency,
+                          limit=args.limit, sectors=args.sectors,
+                          include_insider=args.insider, force_refresh=args.refresh,
+                          quiet=args.quiet)
+    except FileNotFoundError as e:
+        print(f"\n  {R}Candidate universe not found: {e}{X}")
+        print("  Run universe_screen.py first to build data/candidates.json.\n")
+        return 2
+    return 0
+
+
 # ─── MAIN ──────────────────────────────────────────────────────────────────
 def evaluate(ticker):
     data = get_data(ticker)
@@ -852,6 +1566,11 @@ def evaluate(ticker):
     return {"ticker": ticker, "sector": m["sector"], "composite": sc["composite"]}
 
 def main():
+    # Batch mode (v5.4) is opt-in via flags. Tickers never start with "-", so
+    # the original single-ticker path below is reached exactly as before.
+    if any(arg.startswith("-") for arg in sys.argv[1:]):
+        return batch_main(sys.argv[1:])
+
     print(f"\n  {B}{C}╔═════════════════════════════════════╗{X}")
     print(f"  {B}{C}║  Stock Evaluator v5.3 Risk-Adjusted ║{X}")
     print(f"  {B}{C}╚═════════════════════════════════════╝{X}")
@@ -879,4 +1598,4 @@ def main():
         evaluate(ticker.upper())
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
