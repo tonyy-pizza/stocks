@@ -154,6 +154,31 @@ def market_adjusted_threshold(eigenvalues, N, T):
     return plain * sigma2, sigma2, plain
 
 
+def clean_correlation(decomp):
+    """The MP-cleaned correlation matrix: signal eigenvalues kept, the noise
+    band flattened to its own average, then rescaled to a unit diagonal.
+
+    Textbook eigenvalue clipping (Laloux et al.). A sample correlation between
+    two names is a noisy estimate; this keeps the part the MP edge says is real
+    and averages the rest away, which is what you want before acting on a
+    single pairwise number. The market mode stays in - two names moving
+    together because the whole market moved are still moving together.
+    """
+    eigenvalues, eigvecs = decomp["eigenvalues"], decomp["eigvecs"]
+    n_signal = max(1, decomp["n_signal"])
+
+    cleaned = eigenvalues.copy()
+    if n_signal < len(cleaned):
+        cleaned[n_signal:] = float(cleaned[n_signal:].mean())
+
+    matrix = eigvecs @ np.diag(cleaned) @ eigvecs.T
+    scale = np.sqrt(np.diag(matrix))
+    scale[scale == 0] = 1.0
+    matrix = matrix / np.outer(scale, scale)
+    np.fill_diagonal(matrix, 1.0)
+    return pd.DataFrame(matrix, index=decomp["corr"].index, columns=decomp["corr"].columns)
+
+
 # -------------------------------------------------------------------------
 # INPUT
 # -------------------------------------------------------------------------
