@@ -1572,7 +1572,7 @@ def main():
         return batch_main(sys.argv[1:])
 
     print(f"\n  {B}{C}╔═════════════════════════════════════╗{X}")
-    print(f"  {B}{C}║  Stock Evaluator v5.3 Risk-Adjusted ║{X}")
+    print(f"  {B}{C}║  Stock Evaluator v5.4 Risk-Adjusted ║{X}")
     print(f"  {B}{C}╚═════════════════════════════════════╝{X}")
 
     # CLI mode: python stock_evaluator.py TICKER [TICKER ...]
