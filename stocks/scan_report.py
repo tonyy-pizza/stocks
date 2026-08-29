@@ -37,7 +37,9 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -104,10 +106,26 @@ SCORED = DATA_DIR / "scored_candidates.json"
 SENTIMENT = DATA_DIR / "sentiment.json"
 CLUSTERED = DATA_DIR / "clustered.json"
 SIZED = DATA_DIR / "sized_candidates.json"
+ARCHIVE_DIR = DATA_DIR / "archive"
 
-# How many survivors get a sentiment pull. Sentiment costs several requests
-# per name (Yahoo news + Reddit search), so it runs on the top of the list.
-SENTIMENT_TOP = 25
+# How many survivors get a sentiment pull, and how hard that stage is allowed
+# to push.
+#
+# Sentiment is the most fragile stage in the pipeline and the arithmetic is
+# worth stating: ps2.py issues up to 12 subreddit targets x 4 queries = 48
+# subreddit requests plus ~5-10 global searches per ticker, against an
+# unauthenticated endpoint that rate-limits. At 25 names that is ~1,375
+# requests in one run. 15 is a more honest default; raise it deliberately.
+SENTIMENT_TOP = 15
+
+# Pause between tickers. The per-request sleeps inside ps2.py pace one
+# ticker's queries; this paces the tickers themselves.
+SENTIMENT_PAUSE = 2.0
+
+# Stop the stage after this many consecutive failures. Once Reddit starts
+# refusing, grinding through the rest of the list just adds traffic to an
+# endpoint that has already said no.
+SENTIMENT_MAX_CONSECUTIVE_FAILURES = 3
 
 # Sector ETF suggested when a whole cluster scores alike - the industry call
 # is then the decision, not the name.
@@ -223,6 +241,8 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
         "source": str(path) if path else None,
         "sentiment": {},
         "skipped": [],
+        "diagnostics": {},
+        "blocked_count": 0,
     }
 
     if module is None:
@@ -235,8 +255,10 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
         return document
 
     if not quiet:
-        print(f"  sentiment: {len(tickers)} survivor(s) via {path.name}")
+        print(f"  sentiment: {len(tickers)} survivor(s) via {path.name} "
+              f"(~{len(tickers) * 55} reddit requests worst case)")
 
+    consecutive_failures = 0
     for i, ticker in enumerate(tickers, 1):
         def _pull(ticker=ticker):
             # The evaluator's own yfinance calls chatter about cookies/crumbs on
@@ -252,27 +274,78 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
             combined = (result or {}).get("combined") or {}
             if combined.get("overall") is None:
                 raise ValueError(f"no combined sentiment for {ticker}")
+            diagnostics = ((result or {}).get("reddit") or {}).get("diagnostics") or {}
             return {
                 "overall": combined.get("overall"),
                 "confidence": combined.get("confidence"),
                 "sources": combined.get("contributing_sources"),
                 "interpretation": combined.get("interpretation"),
+                "_diagnostics": {
+                    "requests_made": diagnostics.get("requests_made"),
+                    "blocked": bool(diagnostics.get("blocked")),
+                    "block_reason": diagnostics.get("block_reason"),
+                    "queries_issued": len(diagnostics.get("queries_issued") or []),
+                    "errors": (diagnostics.get("errors") or [])[:3],
+                },
             }
 
+        # max_retries=1 on purpose. Everywhere else in this project a retry is
+        # one request; here a single "attempt" is ~55 Reddit requests, so an
+        # outer retry multiplies load against an endpoint that is already
+        # rate-limiting. ps2.py has its own per-request backoff and its own
+        # blocked circuit breaker - that is the right place for retries.
         scores = md.cached_fetch(f"{ticker}_sentiment",
-                                 lambda pull=_pull: md.fetch_with_backoff(pull, max_retries=2),
+                                 lambda pull=_pull: md.fetch_with_backoff(pull, max_retries=1),
                                  md.TTL_PRICE, cache_type="screener",
                                  force_refresh=force_refresh)
         if scores is None:
+            consecutive_failures += 1
             document["skipped"].append({"ticker": ticker, "reason": "sentiment fetch failed"})
             if not quiet:
                 print(f"    [{i:>3}/{len(tickers)}] {ticker:<8} {Y}skipped{X}")
+            if consecutive_failures >= SENTIMENT_MAX_CONSECUTIVE_FAILURES:
+                remaining = tickers[i:]
+                document["aborted"] = {
+                    "after": ticker,
+                    "reason": f"{consecutive_failures} consecutive failures - stopping "
+                              f"rather than adding load to an endpoint that is refusing",
+                    "not_attempted": remaining,
+                }
+                for skipped in remaining:
+                    document["skipped"].append({"ticker": skipped,
+                                                "reason": "not attempted - stage aborted"})
+                if not quiet:
+                    print(f"  {Y}stopping the sentiment stage: {consecutive_failures} "
+                          f"consecutive failures, {len(remaining)} name(s) not attempted{X}")
+                break
             continue
+
+        consecutive_failures = 0
+        diagnostics = scores.pop("_diagnostics", None) or {}
+        if diagnostics:
+            document["diagnostics"][ticker] = diagnostics
+            if diagnostics.get("blocked"):
+                document["blocked_count"] += 1
         document["sentiment"][ticker] = scores
         if not quiet:
             overall = scores.get("overall")
-            print(f"    [{i:>3}/{len(tickers)}] {ticker:<8} {colour(overall)}")
+            requests_made = diagnostics.get("requests_made")
+            trail = f"  {D}{requests_made} reddit req{X}" if requests_made else ""
+            print(f"    [{i:>3}/{len(tickers)}] {ticker:<8} {colour(overall)}{trail}")
 
+        if i < len(tickers) and not md.was_cache_hit():
+            time.sleep(SENTIMENT_PAUSE)
+
+    # What the endpoint actually did, so the volume question has an answer
+    # after a real run instead of an estimate.
+    totals = [d.get("requests_made") for d in document["diagnostics"].values()
+              if isinstance(d.get("requests_made"), int)]
+    document["request_summary"] = {
+        "tickers_attempted": len(document["sentiment"]) + len(document["skipped"]),
+        "reddit_requests_total": sum(totals) if totals else None,
+        "reddit_requests_per_ticker": round(sum(totals) / len(totals), 1) if totals else None,
+        "blocked_tickers": document["blocked_count"],
+    }
     write_json(document, output_path)
     return document
 
@@ -375,6 +448,43 @@ def run_pipeline(args):
     return status
 
 
+# ─── ARCHIVE ───────────────────────────────────────────────────────────────
+
+def archive_run(status, quiet=False):
+    """Snapshot this run's outputs to data\\archive\\<timestamp>\\.
+
+    Only when something actually re-ran - re-rendering yesterday's files does
+    not create a new day's history. Without this there is no way to ask later
+    how a scan's picks actually did, and the exit review has nothing to
+    measure a holding's score against.
+    """
+    if not any(row["action"].startswith("ran") for row in status):
+        return None
+
+    stamp = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    target = ARCHIVE_DIR / stamp
+    target.mkdir(parents=True, exist_ok=True)
+
+    copied = []
+    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED):
+        if path.exists():
+            try:
+                shutil.copy2(path, target / path.name)
+                copied.append(path.name)
+            except OSError as e:
+                if not quiet:
+                    print(f"  {Y}could not archive {path.name}: {e}{X}")
+    if not copied:
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        return None
+    if not quiet:
+        print(f"  {D}archived {len(copied)} file(s) to archive/{stamp}{X}")
+    return target
+
+
 # ─── REPORT ────────────────────────────────────────────────────────────────
 
 def timestamp_range(candidates):
@@ -411,13 +521,21 @@ def flag_cells(candidate, sentiment):
     else:
         cells.append(f"{D}·trend{X}")
 
-    pattern = candidate.get("divergence_pattern")
-    if pattern == "price_disconnect":
-        cells.append(f"{G}disconnect{X}")
-    elif pattern == "trend_confirms_decline":
-        cells.append(f"{R}value-trap{X}")
-    else:
-        cells.append(f"{D}·         {X}")
+    # The divergence pattern crossed with sentiment, when sentiment had a
+    # confident read - a price_disconnect nobody is talking about and one the
+    # public is actively negative on are not the same situation.
+    conviction = ((candidate.get("sizing") or {}).get("conviction")
+                  or "not_applicable")
+    verdicts = {
+        "disconnect_supported":  f"{G}disconnect+{X}",
+        "disconnect_contested":  f"{Y}disconnect?{X}",
+        "disconnect_unverified": f"{G}disconnect·{X}",
+        "trap_confirmed":        f"{R}value-trap!{X}",
+        "trap_contested":        f"{R}trap-hype  {X}",
+        "trap_unverified":       f"{R}value-trap {X}",
+        "not_applicable":        f"{D}·          {X}",
+    }
+    cells.append(verdicts.get(conviction, f"{D}·          {X}"))
 
     scores = (sentiment or {}).get(candidate["ticker"]) or {}
     overall = _num(scores.get("overall"))
@@ -498,6 +616,16 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
         if sent_skipped:
             parts.append(f"{sent_skipped} skipped by sentiment")
         print(f"  {'Partial data':<18} {Y}{'; '.join(parts)}{X}")
+    summary = (sentiment_doc or {}).get("request_summary") or {}
+    if summary.get("reddit_requests_total"):
+        blocked = summary.get("blocked_tickers") or 0
+        line = (f"{summary['reddit_requests_total']} reddit requests, "
+                f"{summary['reddit_requests_per_ticker']}/ticker")
+        if blocked:
+            line += f", {blocked} ticker(s) rate-limited"
+        print(f"  {'Sentiment cost':<18} {line}")
+    if (sentiment_doc or {}).get("aborted"):
+        print(f"  {'Sentiment':<18} {Y}{sentiment_doc['aborted']['reason']}{X}")
     if (cluster_doc or {}).get("insufficient_data_for_clustering"):
         print(f"  {'Clustering':<18} {Y}{cluster_doc.get('note')}{X}")
     if sized_doc.get("note"):
@@ -515,6 +643,21 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
         rule()
         print()
         return
+
+    reviews = sized_doc.get("holdings_review") or []
+    if reviews:
+        print()
+        h("EXIT REVIEW — current holdings, re-scored")
+        rule("─")
+        order = {"exit_review": 0, "watch": 1, "unavailable": 2, "hold": 3}
+        for review in sorted(reviews, key=lambda r: order.get(r["verdict"], 9)):
+            composite = _num(review.get("composite"))
+            tint = {"exit_review": R, "watch": Y, "unavailable": D}.get(review["verdict"], G)
+            delta = review.get("composite_delta")
+            shift = "" if delta is None else f"  {delta:+.2f} since last scan"
+            print(f"    {review['ticker']:<9} {colour(composite)} {bar(composite)}  "
+                  f"{tint}{review['verdict']}{X}{shift}")
+            print(f"    {'':<9} {D}{review['reasons'][0]}{X}")
 
     # Group by cluster; demoted peers nest under their winner.
     clusters, standalone = {}, []
@@ -572,8 +715,10 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
     h("LEGEND")
     print(f"  {G}✓liq{X}/{R}✗liq{X} liquidity · {G}✓trend{X}/{R}✗trend{X}/{D}·trend{X} "
           f"multi-year ROA (dot = insufficient history)")
-    print(f"  {G}disconnect{X} price low, trend intact · {R}value-trap{X} price low, "
-          f"trend deteriorating · sent = 0-10 sentiment")
+    print(f"  {G}disconnect+{X} price low, trend intact, public read agrees · "
+          f"{Y}disconnect?{X} sentiment contests it · {G}disconnect·{X} no sentiment")
+    print(f"  {R}value-trap!{X} trend and sentiment both negative · {R}trap-hype{X} "
+          f"trend down but sentiment high · sent = 0-10 sentiment")
     if args.show_stages and status:
         print()
         h("STAGES")
@@ -611,6 +756,8 @@ def main(argv=None):
     parser.add_argument("--sentiment-top", type=int, default=SENTIMENT_TOP, metavar="N",
                         help=f"how many survivors get a sentiment pull "
                              f"(default {SENTIMENT_TOP})")
+    parser.add_argument("--no-archive", action="store_true",
+                        help="do not snapshot this run to data/archive/<timestamp>/")
     parser.add_argument("--show-stages", action="store_true",
                         help="list each stage's action in the report footer")
     parser.add_argument("--quiet", action="store_true", help="suppress stage progress")
@@ -633,6 +780,8 @@ def main(argv=None):
                   f"{DATA_DIR}{X}")
     else:
         status = run_pipeline(args)
+        if not args.no_archive:
+            archive_run(status, quiet=args.quiet)
 
     sized_doc = read_json(SIZED)
     if sized_doc is None:

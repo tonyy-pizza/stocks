@@ -112,9 +112,28 @@ LOADING_K = 1.0
 MIN_CLUSTER_CORR = 0.30
 MIN_CLUSTER_SIZE = 2
 
-# Composite-score spread (0-10 scale) above which the members are not
-# interchangeable and one of them is the pick.
-DISPERSION_THRESHOLD = 1.0
+# When is one member of a cluster actually the pick, rather than the cluster
+# being an industry call?
+#
+# This used to test stdev > 1.0, which is not size-stable: the same standout
+# (one name 2.0 above an otherwise identical peer group) gives stdev 1.41 at
+# n=2 and 0.71 at n=8, so an identical situation resolved differently
+# depending on how many peers happened to be in the cluster. It also fired on
+# a smooth gradient with no standout at all - scores 8.0/7.3/6.6/5.9/5.2 give
+# stdev 1.11 and "pick_winner", while the top two names are 0.70 apart.
+#
+# Both tests below are size-independent, and they ask the question directly:
+#   - a real winner beats the RUNNER-UP by more than score noise, and
+#   - it stands above the BODY of the cluster, not just its nearest peer.
+# On the live test clusters this keeps the airlines as pick_winner (DAL leads
+# by 0.96) and correctly demotes the semis to industry_wide, where TSM 9.10 /
+# MU 9.03 / NVDA 9.00 are a three-way tie the old rule resolved by 0.07.
+#
+# 0.5 is roughly the resolution of the composite: below that gap the ordering
+# is not meaningful. stdev and range are still reported, as description.
+MIN_WINNER_GAP = 0.5     # best vs runner-up
+MIN_WINNER_LEAD = 1.0    # best vs the median of the rest
+DISPERSION_THRESHOLD = MIN_WINNER_LEAD   # kept for callers that pass it in
 
 
 def _num(value) -> Optional[float]:
@@ -396,27 +415,37 @@ def resolve_cluster(cluster, scores):
                         "resolution_note": "not enough scored members to rank"})
         return cluster
 
-    values = list(usable.values())
+    values = sorted(usable.values(), reverse=True)
     dispersion = statistics.stdev(values)
-    cluster["dispersion"] = round(dispersion, 4)
-    cluster["score_range"] = round(max(values) - min(values), 4)
+    gap = values[0] - values[1]
+    lead = values[0] - statistics.median(values[1:])
 
-    if dispersion > DISPERSION_THRESHOLD:
+    cluster["dispersion"] = round(dispersion, 4)          # descriptive only
+    cluster["score_range"] = round(values[0] - values[-1], 4)
+    cluster["winner_gap"] = round(gap, 4)
+    cluster["winner_lead"] = round(lead, 4)
+
+    if gap >= MIN_WINNER_GAP and lead >= MIN_WINNER_LEAD:
         winner = max(sorted(usable), key=lambda t: usable[t])
         cluster.update({
             "resolution": "pick_winner",
             "winner": winner,
             "demoted_peers": [t for t in members if t != winner],
-            "resolution_note": (f"score spread {dispersion:.2f} above "
-                                f"{DISPERSION_THRESHOLD:.2f}: members are not interchangeable"),
+            "resolution_note": (f"leads the runner-up by {gap:.2f} and the rest of the "
+                                f"cluster by {lead:.2f}: a real standout"),
         })
     else:
+        if gap < MIN_WINNER_GAP:
+            why = (f"top two are {gap:.2f} apart, inside the {MIN_WINNER_GAP:.2f} "
+                   f"resolution of the composite - no meaningful winner")
+        else:
+            why = (f"best name leads the rest by only {lead:.2f} "
+                   f"(under {MIN_WINNER_LEAD:.2f}): members score alike")
         cluster.update({
             "resolution": "industry_wide",
             "winner": None,
             "demoted_peers": [],
-            "resolution_note": (f"score spread {dispersion:.2f} within "
-                                f"{DISPERSION_THRESHOLD:.2f}: members score alike"),
+            "resolution_note": why,
         })
     return cluster
 
@@ -446,9 +475,9 @@ def cluster_shortlist(input_path=None, output_path=None, top=None, min_composite
                       lookback_years=None, loading_k=LOADING_K, min_corr=MIN_CLUSTER_CORR,
                       dispersion_threshold=None, force_refresh=False, quiet=False):
     """Read the scored shortlist, cluster it, write data\\clustered.json."""
-    global DISPERSION_THRESHOLD
+    global DISPERSION_THRESHOLD, MIN_WINNER_LEAD
     if dispersion_threshold is not None:
-        DISPERSION_THRESHOLD = dispersion_threshold
+        DISPERSION_THRESHOLD = MIN_WINNER_LEAD = dispersion_threshold
 
     input_path = Path(input_path) if input_path else INPUT_PATH
     output_path = Path(output_path) if output_path else OUTPUT_PATH
@@ -621,8 +650,8 @@ def main(argv=None):
                              f"(default {MIN_CLUSTER_CORR})")
     parser.add_argument("--dispersion", type=float, default=DISPERSION_THRESHOLD,
                         metavar="SD",
-                        help=f"score spread above which a cluster becomes pick_winner "
-                             f"(default {DISPERSION_THRESHOLD})")
+                        help=f"how far the best name must lead the rest of its cluster "
+                             f"to become pick_winner (default {MIN_WINNER_LEAD})")
     parser.add_argument("--refresh", action="store_true", help="ignore cached prices")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true",

@@ -63,9 +63,23 @@ from yfinance import EquityQuery   # query construction only - no network here
 DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (md.BASE_DIR / "data"))
 OUTPUT_PATH = DATA_DIR / "candidates.json"
 
-# Loose by design. Every one of these is a "obviously not worth analysing"
-# cutoff, not an investment opinion.
-DEFAULT_MAX_PE         = 40.0          # loose ceiling; no floor by default
+# Loose by design. Every one of these is an "obviously not worth analysing"
+# cutoff, not an investment opinion - which is why there is no P/E ceiling
+# here by default.
+#
+# There used to be one (P/E < 40). Measured against the live universe it
+# removed 541 of 3,209 names, and only 430 of those were actually expensive:
+# 74 were excluded despite a trailing P/E under 40, because Yahoo's screener
+# field peratio.lasttwelvemonths is null for them even when trailingPE has a
+# value, and 37 had no trailing P/E at all - a company whose trailing EPS is
+# temporarily wrecked by a one-off charge looks identical to a company with no
+# earnings. That last group is the fundamentals-intact/price-depressed case
+# this whole pipeline exists to find, so the filter was cutting exactly the
+# names it should have been keeping. Valuation is judgment, and judgment
+# belongs in Stage 1's sector-aware scoring, not in the wide net.
+#
+# --max-pe puts a ceiling back for a one-off run.
+DEFAULT_MAX_PE         = None          # no valuation judgment at Stage 0
 DEFAULT_MIN_AVG_VOLUME = 200_000       # shares/day - enough to actually trade
 DEFAULT_MIN_MARKET_CAP = 300_000_000   # drops nano/micro-cap shells
 
@@ -357,7 +371,8 @@ def parse_args(argv=None):
     parser.add_argument("--include-canada", action="store_true",
                         help="also screen Canadian listings (tagged CAD)")
     parser.add_argument("--max-pe", type=float, default=DEFAULT_MAX_PE,
-                        help=f"trailing P/E ceiling (default {DEFAULT_MAX_PE:g}, 0 to disable)")
+                        help="optional trailing P/E ceiling (default: none - see the "
+                             "note in CONFIG for why Stage 0 does not filter on P/E)")
     parser.add_argument("--min-pe", type=float, default=None,
                         help="optional trailing P/E floor (default: none, loss-makers allowed)")
     parser.add_argument("--min-volume", type=float, default=DEFAULT_MIN_AVG_VOLUME,

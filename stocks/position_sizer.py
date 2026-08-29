@@ -67,7 +67,8 @@ _add_script_dir_to_path()
 
 import market_data as md                                   # noqa: E402
 import rmt_cluster as rc                                    # noqa: E402
-from stock_evaluator import position_guidance               # noqa: E402
+from stock_evaluator import (position_guidance, score_candidate,      # noqa: E402
+                             G, Y, R, X)                              # same palette
 
 
 # -------------------------------------------------------------------------
@@ -78,6 +79,7 @@ DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"
 HOLDINGS_PATH = DATA_DIR / "holdings.json"
 SCORED_PATH = DATA_DIR / "scored_candidates.json"
 CLUSTERED_PATH = DATA_DIR / "clustered.json"
+SENTIMENT_PATH = DATA_DIR / "sentiment.json"
 OUTPUT_PATH = DATA_DIR / "sized_candidates.json"
 
 # Above this correlation with a holding, a candidate is treated as partly the
@@ -99,6 +101,36 @@ CORRELATION_BASIS = "raw"
 REDUCTION_FACTOR = 0.50
 
 NO_HOLDINGS_NOTE = "no holdings on file - sizing not correlation-adjusted"
+
+# ── Sentiment x divergence ────────────────────────────────────────────────
+# divergence_pattern says what the FINANCIALS think of a depressed price.
+# Sentiment says what the PUBLIC thinks. They answer different halves of the
+# same question - "is this decline external and temporary" - and a
+# price_disconnect with a negative public narrative is a materially different
+# situation from one nobody is talking about. ps2.py's composite is centred on
+# 5.0 over 0-10, with its own 0-10 confidence.
+SENTIMENT_NEGATIVE = 4.0     # below this the narrative is actively negative
+SENTIMENT_POSITIVE = 6.0     # above this it is actively positive
+SENTIMENT_MIN_CONFIDENCE = 4.0   # below this, sentiment does not get a vote
+
+# How much size a contested read costs. Applied on top of, and reported
+# separately from, the correlation scale so either can be reasoned about alone.
+CONVICTION_SCALE = {
+    "disconnect_supported": 1.00,
+    "disconnect_unverified": 1.00,
+    "disconnect_contested": 0.75,
+    "trap_unverified": 0.65,
+    "trap_contested": 0.60,
+    "trap_confirmed": 0.50,
+    "not_applicable": 1.00,
+}
+
+# ── Exit review ───────────────────────────────────────────────────────────
+# A holding is re-scored through Stage 1 on every run: the entry pipeline is
+# only half a strategy if nothing ever asks whether the thesis still holds.
+EXIT_COMPOSITE = 4.0         # at or below this, the case for holding is gone
+EXIT_WATCH_COMPOSITE = 5.5   # below this, worth a look
+EXIT_DROP = 1.5              # composite fall since the last archived scan
 
 HOLDINGS_TEMPLATE = {
     "_comment": (
@@ -298,6 +330,66 @@ def correlation_to_holdings(candidates, holding_tickers, lookback_years=None,
 
 
 # -------------------------------------------------------------------------
+# SENTIMENT x DIVERGENCE
+# -------------------------------------------------------------------------
+
+def conviction_verdict(divergence, sentiment_scores):
+    """Cross the price/fundamentals divergence with the public narrative.
+
+    price_disconnect says the financials do not explain the price. That is
+    only the "temporarily out of favour" case if the public story does not
+    explain it either - if sentiment is actively negative, the market may be
+    pricing something the last annual statements cannot show yet, and the
+    right response is less size, not the same size.
+
+    Returns (verdict, detail). Sentiment only votes when it is confident
+    enough to be worth listening to.
+    """
+    detail = {"divergence_pattern": divergence, "sentiment": None,
+              "confidence": None, "sentiment_counted": False}
+
+    if divergence not in ("price_disconnect", "trend_confirms_decline"):
+        detail["reason"] = "divergence pattern is neutral; nothing to cross"
+        return "not_applicable", detail
+
+    overall = _num((sentiment_scores or {}).get("overall"))
+    confidence = _num((sentiment_scores or {}).get("confidence"))
+    detail["sentiment"] = overall
+    detail["confidence"] = confidence
+
+    if overall is None:
+        detail["reason"] = "no sentiment on file for this name"
+        return ("disconnect_unverified" if divergence == "price_disconnect"
+                else "trap_unverified"), detail
+    if confidence is not None and confidence < SENTIMENT_MIN_CONFIDENCE:
+        detail["reason"] = (f"sentiment confidence {confidence:.1f} below "
+                            f"{SENTIMENT_MIN_CONFIDENCE:.1f}; not counted")
+        return ("disconnect_unverified" if divergence == "price_disconnect"
+                else "trap_unverified"), detail
+
+    detail["sentiment_counted"] = True
+
+    if divergence == "price_disconnect":
+        if overall < SENTIMENT_NEGATIVE:
+            detail["reason"] = (f"price low and trend intact, but the public read is "
+                                f"negative ({overall:.1f}) - the market may know "
+                                f"something the statements do not show yet")
+            return "disconnect_contested", detail
+        detail["reason"] = (f"price low, trend intact, and the public read is "
+                            f"{overall:.1f} - neglect rather than news")
+        return "disconnect_supported", detail
+
+    # trend_confirms_decline
+    if overall > SENTIMENT_POSITIVE:
+        detail["reason"] = (f"fundamentals deteriorating while the public read is "
+                            f"{overall:.1f} - enthusiasm running ahead of the numbers")
+        return "trap_contested", detail
+    detail["reason"] = (f"fundamentals deteriorating and the public read is "
+                        f"{overall:.1f} - both agree")
+    return "trap_confirmed", detail
+
+
+# -------------------------------------------------------------------------
 # SIZING
 # -------------------------------------------------------------------------
 
@@ -339,12 +431,23 @@ def sizing_scale(correlation, threshold, reduction_factor, flat=False):
 
 def size_candidate(ticker, record, cluster, holding, correlations,
                    threshold=CORR_THRESHOLD, reduction_factor=REDUCTION_FACTOR,
-                   flat=False, holdings_on_file=True, basis=CORRELATION_BASIS):
-    """Base guidance from stock_evaluator, then the correlation modifier."""
+                   flat=False, holdings_on_file=True, basis=CORRELATION_BASIS,
+                   sentiment_scores=None, use_conviction=True):
+    """Base guidance from stock_evaluator, then two independent modifiers.
+
+    The correlation modifier asks "do I already own this trade". The
+    conviction modifier asks "do the financials and the public story agree
+    about why the price is where it is". They are computed and reported
+    separately, then multiplied, so either can be read on its own.
+    """
     metrics = record.get("metrics") or {}
     scores = {"composite": record.get("composite"),
               "dims": record.get("dims") or {}}
     guidance = position_guidance(metrics, scores, record.get("insider"))
+
+    verdict, conviction_detail = conviction_verdict(
+        record.get("divergence_pattern"), sentiment_scores)
+    conviction_scale = CONVICTION_SCALE.get(verdict, 1.0) if use_conviction else 1.0
 
     base_low, base_high = parse_guide_range(guidance["guide"])
     sizing = {
@@ -364,21 +467,35 @@ def size_candidate(ticker, record, cluster, holding, correlations,
         "correlation_basis": basis,
         "correlated_with": None,
         "correlations": {},
+        "conviction": verdict,
+        "conviction_detail": conviction_detail,
+        "conviction_scale": conviction_scale,
     }
+
+    def finalize(correlation_scale=1.0):
+        """Combine the two modifiers into one adjusted range."""
+        total = correlation_scale * conviction_scale
+        sizing["scale"] = round(total, 4)
+        sizing["reduction"] = round(1.0 - total, 4)
+        sizing["adjusted_guide"] = (apply_reduction(guidance["guide"], total)
+                                    if total != 1.0 else guidance["guide"])
+        sizing["adjusted_low_pct"] = None if base_low is None else round(base_low * total, 2)
+        sizing["adjusted_high_pct"] = None if base_high is None else round(base_high * total, 2)
+        return guidance, sizing
 
     if holding is not None:
         sizing["note"] = "already held - not sized as a new position"
-        return guidance, sizing
+        return finalize()
 
     if not holdings_on_file:
         sizing["note"] = NO_HOLDINGS_NOTE
-        return guidance, sizing
+        return finalize()
 
     pairs = correlations.get(ticker) or {}
     sizing["correlations"] = pairs
     if not pairs:
         sizing["note"] = "no correlation to holdings available for this name"
-        return guidance, sizing
+        return finalize()
 
     worst = max(pairs, key=lambda h: pairs[h].get(basis, 0.0))
     worst_corr = pairs[worst].get(basis)
@@ -389,21 +506,145 @@ def size_candidate(ticker, record, cluster, holding, correlations,
     if worst_corr <= threshold:
         sizing["note"] = (f"no meaningful correlation to holdings (max {worst_corr:.2f} "
                           f"{basis} with {worst}, at or below {threshold:.2f})")
-        return guidance, sizing
+        return finalize()
 
     scale, reduction = sizing_scale(worst_corr, threshold, reduction_factor, flat=flat)
     sizing.update({
         "correlation_adjusted": True,
-        "scale": round(scale, 4),
-        "reduction": round(reduction, 4),
+        "correlation_scale": round(scale, 4),
         "correlated_with": worst,
-        "adjusted_guide": apply_reduction(guidance["guide"], scale),
-        "adjusted_low_pct": None if base_low is None else round(base_low * scale, 2),
-        "adjusted_high_pct": None if base_high is None else round(base_high * scale, 2),
         "note": (f"correlation {worst_corr:.2f} ({basis}) with holding {worst} above "
                  f"{threshold:.2f}: size cut {reduction*100:.0f}%"),
     })
-    return guidance, sizing
+    return finalize(scale)
+
+
+# -------------------------------------------------------------------------
+# EXIT REVIEW - re-score what is already owned
+# -------------------------------------------------------------------------
+
+def latest_archive_scores(data_dir=None):
+    """Composites for every name in the most recent archived scan.
+
+    Gives the exit review a "since when" - a holding that scored 7.8 last
+    month and 5.9 today is a different situation from one that has been 5.9
+    all along, and only the archive can tell them apart.
+    """
+    archive = Path(data_dir or DATA_DIR) / "archive"
+    if not archive.is_dir():
+        return {}, None
+    runs = sorted((d for d in archive.iterdir() if d.is_dir()), reverse=True)
+    for run in runs:
+        document = None
+        path = run / "sized_candidates.json"
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    document = json.load(f)
+            except Exception:
+                document = None
+        if not document:
+            continue
+        scores = {}
+        for entry in document.get("candidates") or []:
+            scores[entry["ticker"]] = _num(entry.get("composite"))
+        for entry in document.get("holdings_review") or []:
+            if entry.get("composite") is not None:
+                scores[entry["ticker"]] = _num(entry.get("composite"))
+        if scores:
+            return scores, run.name
+    return {}, None
+
+
+def review_holdings(holdings, scored_records=None, previous=None,
+                    account_size=None, force_refresh=False, quiet=False):
+    """Run every holding back through Stage 1 and ask whether to keep it.
+
+    The entry pipeline is only half a strategy. This is the other half: the
+    same scoring a candidate gets, applied to what is already owned, so a
+    thesis that has quietly stopped being true shows up on the same page as
+    the new ideas.
+
+    A holding already scored in this run is reused rather than refetched.
+    """
+    previous = previous or {}
+    scored_records = scored_records or {}
+    reviews = []
+
+    for holding in holdings:
+        ticker = holding["ticker"]
+        record = scored_records.get(ticker)
+        reason = None
+        if record is None:
+            record, reason = score_candidate(ticker, account_size=account_size,
+                                             force_refresh=force_refresh)
+
+        if record is None:
+            reviews.append({"ticker": ticker, "verdict": "unavailable",
+                            "reason": reason or "could not be re-scored",
+                            "composite": None, "shares": holding.get("shares"),
+                            "cost_basis": holding.get("cost_basis")})
+            if not quiet:
+                print(f"    {ticker:<8} {Y}unavailable{X} - {reason}")
+            continue
+
+        composite = _num(record.get("composite"))
+        prior = _num(previous.get(ticker))
+        delta = None if (composite is None or prior is None) else round(composite - prior, 2)
+
+        reasons = []
+        verdict = "hold"
+        if composite is not None and composite <= EXIT_COMPOSITE:
+            verdict = "exit_review"
+            reasons.append(f"composite {composite:.2f} at or below {EXIT_COMPOSITE:.1f}")
+        if record.get("divergence_pattern") == "trend_confirms_decline":
+            verdict = "exit_review"
+            reasons.append("price low and the multi-year trend is deteriorating")
+        if delta is not None and delta <= -EXIT_DROP:
+            verdict = "exit_review"
+            reasons.append(f"composite fell {abs(delta):.2f} since the last archived scan")
+        if verdict == "hold":
+            if composite is not None and composite < EXIT_WATCH_COMPOSITE:
+                verdict = "watch"
+                reasons.append(f"composite {composite:.2f} under {EXIT_WATCH_COMPOSITE:.1f}")
+            else:
+                # roa_trend_consistent alone is far too sensitive to use here:
+                # it demands a non-decreasing ROA in every single year, so one
+                # down year in four makes it False and it reads as "watch" on
+                # names scoring 9+. Real deterioration is rising debt AND weak
+                # cash generation together.
+                years = (record.get("trend_detail") or {}).get("fcf_years_available") or 0
+                positive = record.get("fcf_positive_years")
+                weak_fcf = isinstance(positive, int) and years and positive * 2 <= years
+                if record.get("debt_trend") == "increasing" and weak_fcf:
+                    verdict = "watch"
+                    reasons.append(f"debt rising over the window and FCF positive in only "
+                                   f"{positive} of {years} years")
+        if not reasons:
+            reasons.append("fundamentals still support the position")
+
+        reviews.append({
+            "ticker": ticker,
+            "shares": holding.get("shares"),
+            "cost_basis": holding.get("cost_basis"),
+            "composite": composite,
+            "previous_composite": prior,
+            "composite_delta": delta,
+            "rating": record.get("rating"),
+            "verdict": verdict,
+            "reasons": reasons,
+            "divergence_pattern": record.get("divergence_pattern"),
+            "roa_trend_consistent": record.get("roa_trend_consistent"),
+            "debt_trend": record.get("debt_trend"),
+            "warnings": record.get("warnings") or [],
+        })
+        if not quiet:
+            colour = {"exit_review": R, "watch": Y}.get(verdict, G)
+            shift = "" if delta is None else f"  ({delta:+.2f} since last scan)"
+            print(f"    {ticker:<8} {composite if composite is None else f'{composite:.2f}':<6} "
+                  f"{colour}{verdict}{X}{shift}  {reasons[0]}")
+
+    return reviews
 
 
 # -------------------------------------------------------------------------
@@ -431,7 +672,8 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
                    output_path=None, top=None, min_composite=None,
                    corr_threshold=CORR_THRESHOLD, reduction_factor=REDUCTION_FACTOR,
                    flat_reduction=False, correlation_basis=CORRELATION_BASIS,
-                   lookback_years=None, slim=False,
+                   lookback_years=None, slim=False, sentiment_path=None,
+                   use_conviction=True, review_existing=True,
                    force_refresh=False, quiet=False):
     """Combine scored + clustered + sizing into data\\sized_candidates.json."""
     scored_path = Path(scored_path) if scored_path else SCORED_PATH
@@ -440,6 +682,15 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
 
     scored_doc, records = load_scored(scored_path)
     cluster_view, shortlist, clustered_doc = load_clusters(clustered_path)
+
+    sentiment_path = Path(sentiment_path) if sentiment_path else SENTIMENT_PATH
+    sentiment = {}
+    if sentiment_path.exists():
+        try:
+            with open(sentiment_path, "r", encoding="utf-8") as f:
+                sentiment = (json.load(f) or {}).get("sentiment") or {}
+        except Exception:
+            sentiment = {}
 
     # Stage 2's shortlist is the set to size; without it, everything scored.
     tickers = [t for t in shortlist if t in records] or sorted(records)
@@ -474,7 +725,8 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
             ticker, record, cluster, holding, correlations,
             threshold=corr_threshold, reduction_factor=reduction_factor,
             flat=flat_reduction, holdings_on_file=holdings_on_file,
-            basis=correlation_basis)
+            basis=correlation_basis, sentiment_scores=sentiment.get(ticker),
+            use_conviction=use_conviction)
 
         entry = {
             "ticker": ticker,
@@ -506,6 +758,16 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
             entry["insider"] = record.get("insider")
         out_candidates.append(entry)
 
+    holdings_review = []
+    if review_existing and holdings:
+        previous, previous_run = latest_archive_scores()
+        if not quiet:
+            print(f"\n  exit review: re-scoring {len(holdings)} holding(s)"
+                  + (f" against the {previous_run} scan" if previous_run else ""))
+        holdings_review = review_holdings(
+            holdings, scored_records=records, previous=previous,
+            account_size=None, force_refresh=force_refresh, quiet=quiet)
+
     document = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "holdings_on_file": len(holdings),
@@ -523,8 +785,13 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
             "min_composite": min_composite,
             "slim": slim,
             "correlation_panel": corr_meta or None,
+            "conviction_sizing": use_conviction,
+            "conviction_scale": CONVICTION_SCALE,
+            "sentiment_input": str(sentiment_path) if sentiment else None,
+            "sentiment_names": len(sentiment),
         },
         "holdings": holdings,
+        "holdings_review": holdings_review,
         "candidates": out_candidates,
     }
     write_json(document, output_path)
@@ -532,6 +799,15 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
     if not quiet:
         held = [c for c in out_candidates if c["already_held"]]
         cut = [c for c in out_candidates if c["sizing"]["correlation_adjusted"]]
+        contested = [c for c in out_candidates
+                     if c["sizing"]["conviction"] in ("disconnect_contested", "trap_unverified",
+                                                      "trap_contested", "trap_confirmed")]
+        if contested:
+            print(f"\n  conviction modifier applied to {len(contested)}:")
+            for c in contested:
+                s = c["sizing"]
+                print(f"    {c['ticker']:<8} {s['conviction']:<22} "
+                      f"x{s['conviction_scale']:.2f}  {s['conviction_detail'].get('reason','')[:60]}")
         print(f"\n  sized {len(out_candidates)}  ·  already held {len(held)}  "
               f"·  correlation-reduced {len(cut)}")
         for c in sorted(cut, key=lambda c: -(c["sizing"]["max_correlation"] or 0))[:12]:
@@ -575,6 +851,13 @@ def main(argv=None):
                              f"MP-filtered estimate (default {CORRELATION_BASIS})")
     parser.add_argument("--lookback-years", type=float, metavar="YEARS",
                         help="override the adaptive correlation window")
+    parser.add_argument("--sentiment", metavar="PATH",
+                        help=f"sentiment input (default {SENTIMENT_PATH})")
+    parser.add_argument("--no-conviction", action="store_true",
+                        help="report the sentiment/divergence verdict but do not let "
+                             "it change position size")
+    parser.add_argument("--no-exit-review", action="store_true",
+                        help="skip re-scoring existing holdings")
     parser.add_argument("--slim", action="store_true",
                         help="drop the heavy metrics/frameworks blobs from the output")
     parser.add_argument("--refresh", action="store_true", help="ignore cached prices")
@@ -594,6 +877,9 @@ def main(argv=None):
                        flat_reduction=args.flat_reduction,
                        correlation_basis=args.correlation_basis,
                        lookback_years=args.lookback_years, slim=args.slim,
+                       sentiment_path=args.sentiment,
+                       use_conviction=not args.no_conviction,
+                       review_existing=not args.no_exit_review,
                        force_refresh=args.refresh, quiet=args.quiet)
     except FileNotFoundError as e:
         print(f"\n  Missing input: {e}")
