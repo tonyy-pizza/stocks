@@ -70,7 +70,32 @@ what to run, rather than an error.
 | **Cluster explorer** | The clusters from `clustered.json`, which is richer than the trimmed `cluster` field on each candidate: members, average correlation, dispersion, eigenvalue, share of variance, the resolution and why it resolved that way, plus the winner and its demoted peers. Each cluster gets a correlation heatmap. |
 | **Position sizing simulator** | The core view. Move the correlation threshold, reduction factor, basis (raw/cleaned) and reduction mode (proportional/flat), and every not-yet-held candidate is re-sized live. Select a handful of names for a rollup: combined allocation, sector concentration, and which holdings are taking the most size out of the selection. |
 | **Ticker drill-down** | The full blob behind one name — every metric group, Piotroski, Altman Z, Graham, Magic Formula, the DCF scenarios, the value screen, insider activity, warnings and notes. Plus the optional price sparkline. |
-| **Holdings** | `holdings.json` as a table, with book value totalled **per currency**, and the exit review `position_sizer.py` runs over each holding. Read-only. |
+| **Holdings** | `holdings.json` as a table, with book value totalled **per currency**, and the exit review `position_sizer.py` runs over each holding — now including its ROA trend and data coverage. Read-only. |
+
+It also reads two files it does not put in a view: `candidates.json`, for
+whether Stage 0's universe came back whole, and `run_status.json`, for whether
+the last scan finished. Both go in the sidebar, and a halted run gets a banner
+across the top of every view — see below.
+
+## When the last scan did not finish
+
+`scan_report.py` stops the pipeline when a required stage fails, rather than
+letting the next stage read yesterday's file and report it as today's. It
+records what happened in `run_status.json`, and this is the only thing that
+reads it back.
+
+That matters here more than in the terminal. A halted run leaves new files
+beside stale ones, and **the ages will not look wrong** — the stages that ran
+are fresh, and the ones that never ran are the problem. So the banner comes
+before any staleness note: it names the stage that stopped the run, lists what
+was never attempted, and says plainly that the views below are showing two
+different scans at once.
+
+The sidebar carries the matching Stage 0 line. `universe_screen.py` refuses to
+overwrite a good `candidates.json` when more than half its region/sector
+partitions fail, but a run under that bar still writes a thinner universe than
+usual — and downstream, a smaller universe is indistinguishable from a tighter
+market. Stage 0 records the counts; the sidebar is where they are read.
 
 ## How the live re-sizing works
 
@@ -120,6 +145,16 @@ what the file says. If a future change to `position_sizer.py` makes the two
 disagree, that check goes red instead of the dashboard quietly showing numbers
 the pipeline would not.
 
+It compares the guide **sentence** as well as the percentages, and reports a
+text-only difference separately from a numeric one. Those are genuinely
+different findings, and one of them used to go unasked: `apply_reduction()` once
+scaled only the first percentage in a guide, so a halved candidate read
+`Core: 1.5%–2.5%; up to 8% with diversification` — correct numbers, and an 8%
+ceiling quoted on a position just cut to 2.5%. A numbers-only check cannot see
+that, which is why it survived as long as it did. A text-only mismatch now
+usually just means the file predates the current `position_sizer.py`, so it is
+reported as a note rather than as drift.
+
 ### What the heatmap can and cannot show
 
 `position_sizer.py` builds one correlation matrix over candidates *and* holdings
@@ -143,7 +178,11 @@ relationship the sizing simulator actually acts on.
   read-only.
 - **Never writes** to `holdings.json` either. It is the one canonical file the
   rest of the pipeline reads, so v1 displays it and no more — edit it directly
-  and re-run the scan.
+  and re-run the scan. Each entry takes an optional `"currency"`, and when it
+  is there it wins: you know what you paid in better than any inference does.
+  Without it the currency comes from the scan's `quote_currency`, then from a
+  `.TO`/`.V`/`.CN`/`.NE` suffix, and stays *unknown* rather than being guessed
+  into a total.
 - **Never sums across currencies.** `quote_currency` is CAD or USD per ticker.
   Position guides are percentages of the account and so are comparable across
   both; cost-basis totals are not, so they are reported per currency with the

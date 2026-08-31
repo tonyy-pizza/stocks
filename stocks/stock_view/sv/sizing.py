@@ -242,12 +242,24 @@ def verify(candidates, params: dict, tolerance: float = 0.011):
 
     The tolerance is one unit in the last place of the stored values, which are
     rounded to two decimals.
+
+    The guide STRING is checked too, separately from the numbers. Those are two
+    different questions, and one of them used to go unasked: apply_reduction()
+    once scaled only the first percentage in a guide, so a halved candidate
+    read "Core: 1.5%-2.5%; up to 8% with diversification" - correct numbers,
+    and a sentence quoting an 8% ceiling on a position just cut to 2.5%. A
+    numbers-only check cannot see that, which is precisely why the defect
+    survived as long as it did.
+
+    A text-only difference is reported apart from a numeric one because it
+    usually means something milder: the file was written by an older
+    position_sizer whose wording differed, not that the sizing has drifted.
     """
     if not PIPELINE.ok:
         return {"ran": False, "reason": "position_sizer.py could not be imported"}
 
     controls = controls_from_params(params)
-    checked, skipped, mismatches = 0, 0, []
+    checked, skipped, mismatches, text_mismatches = 0, 0, [], []
     for candidate in candidates:
         stored = candidate.get("sizing") or {}
         if stored.get("adjusted_high_pct") is None:
@@ -271,8 +283,19 @@ def verify(candidates, params: dict, tolerance: float = 0.011):
                     "ticker": candidate.get("ticker"),
                     "detail": f"{field}: file {expected}, recomputed {recomputed}",
                 })
+
+        stored_guide = stored.get("adjusted_guide")
+        if stored_guide and got.adjusted_guide and stored_guide != got.adjusted_guide:
+            text_mismatches.append({
+                "ticker": candidate.get("ticker"),
+                "file": stored_guide,
+                "recomputed": got.adjusted_guide,
+            })
+
     return {"ran": True, "checked": checked, "skipped": skipped,
-            "mismatches": mismatches, "ok": not mismatches, "controls": controls}
+            "mismatches": mismatches, "text_mismatches": text_mismatches,
+            "ok": not mismatches, "text_ok": not text_mismatches,
+            "controls": controls}
 
 
 # ── rollup over a selection ───────────────────────────────────────────────

@@ -139,10 +139,15 @@ HOLDINGS_TEMPLATE = {
         "ticker: the Yahoo symbol (RY.TO for a TSX listing). "
         "shares: number of shares held. "
         "cost_basis: your average price per share, in the listing's own currency. "
+        "currency: optional - the currency cost_basis is in (USD, CAD). Leave it "
+        "out and it is inferred from the scan, or from a .TO/.V/.CN/.NE suffix; "
+        "set it when you want to be certain, since cost-basis totals are grouped "
+        "by currency and never summed across them. "
         "Delete the example entry below - entries marked _example are ignored."
     ),
     "holdings": [
-        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00, "_example": True}
+        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00,
+         "currency": "USD", "_example": True}
     ],
 }
 
@@ -195,10 +200,16 @@ def load_holdings(holdings_path=None, quiet=False):
         ticker = str(entry.get("ticker") or "").strip().upper()
         if not ticker or ticker == "...":
             continue
+        # An explicit currency is optional and, when present, authoritative:
+        # holdings.json is hand-written, so the person entering a cost basis
+        # knows what currency they paid in better than any inference does.
+        currency = entry.get("currency")
+        currency = str(currency).strip().upper() if isinstance(currency, str) and currency.strip() else None
         holdings.append({
             "ticker": ticker,
             "shares": _num(entry.get("shares")),
             "cost_basis": _num(entry.get("cost_basis")),
+            "currency": currency,
         })
     return holdings, created
 
@@ -817,6 +828,10 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
         if not slim:
             entry["metrics"] = record.get("metrics")
             entry["frameworks"] = record.get("frameworks")
+            # Small, and the only place the FX-converted dollar volume and the
+            # rate it was converted at survive - the Overview's liquidity
+            # column is a bare tick without it.
+            entry["liquidity"] = record.get("liquidity")
             entry["value_screen"] = record.get("value_screen")
             entry["insider"] = record.get("insider")
         out_candidates.append(entry)

@@ -258,6 +258,44 @@ def render(scan):
             st.dataframe(frame.style.format({"raw": "{:.4f}", "cleaned": "{:.4f}"}),
                          width="stretch", hide_index=True)
 
+    liquidity = (candidate.get("liquidity")
+                 or (scan.scored_record(ticker) or {}).get("liquidity")) or {}
+    if liquidity.get("evaluated"):
+        st.markdown("**Liquidity**")
+        share = d.num(liquidity.get("position_pct_of_adv"))
+        cap = d.num(liquidity.get("max_adv_pct"))
+        cells = st.columns(3)
+        cells[0].metric(
+            "One position, as a share of a day's volume",
+            "n/a" if share is None else f"{share * 100:.2f}%",
+            help="A hypothetical position of position_pct of the account, against "
+                 "average daily dollar volume. A flag, never an exclusion.")
+        cells[1].metric("Flagged above", "n/a" if cap is None else f"{cap * 100:.2f}%")
+        cells[2].metric("Thin?", "yes" if candidate.get("liquidity_flag") else "no")
+
+        quote = liquidity.get("quote_currency")
+        account = liquidity.get("account_currency")
+        native = d.num(liquidity.get("avg_daily_dollar_volume"))
+        converted = d.num(liquidity.get("avg_daily_dollar_volume_account"))
+        rate = d.num(liquidity.get("fx_rate"))
+
+        # Worth showing both sides when they differ. The two halves of this
+        # ratio are quoted in different currencies - volume in the stock's,
+        # the position in the account's - and dividing them unconverted
+        # overstated a TSX name's liquidity in a USD account by the whole
+        # exchange rate.
+        if native is not None:
+            line = f"Average daily dollar volume {d.money(native)} {quote or ''}".strip()
+            if converted is not None and rate is not None and rate != 1.0:
+                line += (f"  →  {d.money(converted)} {account} "
+                         f"at {rate:.4f} {quote}→{account}")
+            st.caption(line)
+        if liquidity.get("fx_note") and not liquidity.get("fx_adjusted"):
+            st.warning(liquidity["fx_note"], icon="⚠")
+    elif liquidity.get("note"):
+        st.markdown("**Liquidity**")
+        st.caption(liquidity["note"])
+
     warnings = candidate.get("warnings") or []
     if warnings:
         st.markdown("**Warnings**")

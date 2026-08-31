@@ -28,16 +28,16 @@ def _verdict_css(value):
 def _cost_basis_by_currency(rows, scan):
     """Cost basis totalled per currency, never across them.
 
-    holdings.json records no currency — just ticker, shares and cost_basis in
-    "the listing's own currency". A single total over a mix of TSX and US names
-    would be adding CAD to USD, so the currency is inferred per name (from the
-    scan's own quote_currency where it knows it) and each one is totalled
-    separately.
+    A single total over a mix of TSX and US names would be adding CAD to USD, so
+    each currency is totalled separately. The currency comes from the holding's
+    own `currency` field when it declares one, else from the scan's
+    quote_currency, else from a Canadian ticker suffix - and stays "unknown"
+    when none of those can say, rather than being folded into a total.
     """
     totals = {}
     for row in rows:
         shares, cost = row.get("shares"), row.get("cost_basis")
-        currency = dl.infer_currency(row["ticker"], scan) or "unknown"
+        currency = dl.infer_currency(row["ticker"], scan, row.get("currency")) or "unknown"
         entry = totals.setdefault(currency, {"value": 0.0, "names": [],
                                              "incomplete": []})
         entry["names"].append(row["ticker"])
@@ -82,7 +82,7 @@ def render(scan):
     rows = []
     for row in kept:
         ticker = row["ticker"]
-        currency = dl.infer_currency(ticker, scan)
+        currency = dl.infer_currency(ticker, scan, row.get("currency"))
         shares, cost = row.get("shares"), row.get("cost_basis")
         candidate = next((c for c in scan.candidates if c.get("ticker") == ticker), None)
         rows.append({

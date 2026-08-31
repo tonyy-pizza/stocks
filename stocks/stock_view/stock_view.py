@@ -71,6 +71,7 @@ def sidebar(scan):
                                 (scan.clustered, "clustered", True),
                                 (scan.scored, "scored_candidates", True),
                                 (scan.sentiment, "sentiment", True),
+                                (scan.universe, "candidates", True),
                                 # holdings.json is hand-edited and carries no
                                 # generated_at: an old one is a settled portfolio,
                                 # not stale data.
@@ -82,6 +83,23 @@ def sidebar(scan):
                                f"{loaded.age_text}")
         else:
             st.sidebar.caption(f"🟢 {label} — edited {loaded.age_text}")
+
+    # Stage 0's own account of whether the universe came back whole. A run that
+    # lost partitions still writes a file; downstream a thinner universe looks
+    # exactly like a tighter market, so this is the only place it can be seen.
+    health = scan.universe_health
+    if health and not health["complete"]:
+        parts = []
+        if health["failed"]:
+            parts.append(f"{health['failed']} failed")
+        if health["truncated"]:
+            parts.append(f"{health['truncated']} truncated")
+        st.sidebar.caption(
+            f"⚠ universe: {' · '.join(parts)} of {health['total']} partitions — "
+            f"{health['candidates']:,} names screened, fewer than a clean run")
+    elif health:
+        st.sidebar.caption(f"🟢 universe: {health['total']} partitions clean, "
+                           f"{health['candidates']:,} names screened")
 
     st.sidebar.divider()
     st.sidebar.markdown("**Pipeline**")
@@ -108,10 +126,11 @@ def no_data_yet(scan):
         f"Then press **↻ Reload from disk** in the sidebar.")
 
     rows = []
-    for loaded, label in ((scan.sized, "sized_candidates.json"),
-                          (scan.clustered, "clustered.json"),
+    for loaded, label in ((scan.universe, "candidates.json"),
                           (scan.scored, "scored_candidates.json"),
                           (scan.sentiment, "sentiment.json"),
+                          (scan.clustered, "clustered.json"),
+                          (scan.sized, "sized_candidates.json"),
                           (scan.holdings, "holdings.json")):
         rows.append(f"- `{label}` — {'found' if loaded.exists else (loaded.error or 'missing')}")
     st.markdown("\n".join(rows))
@@ -152,6 +171,33 @@ def main():
             f"view is built on it. Run `py scan_report.py`, then press ↻ Reload. "
             f"The cluster explorer and holdings views work without it.")
         return
+
+    # A halted run leaves new files beside stale ones. Saying so comes before
+    # any staleness note, because the ages will not look wrong - the stages
+    # that did run are fresh, and the ones that never ran are the problem.
+    if scan.run_halted:
+        run = scan.last_run
+        blocking = ", ".join(run.get("blocking_stages") or []) or "a required stage"
+        not_attempted = [row["stage"] for row in (run.get("stages") or [])
+                         if row.get("action") == "not attempted"]
+        message = (f"**The last scan did not complete.** It stopped at "
+                   f"`{blocking}`" + (f", and never ran "
+                   f"{', '.join(f'`{name}`' for name in not_attempted)}"
+                   if not_attempted else "") + ".\n\n"
+                   f"Everything below is read from the files already on disk, so "
+                   f"the stages that did not run are showing the *previous* scan's "
+                   f"numbers next to this one's. Fix what failed, re-run "
+                   f"`py scan_report.py`, then press ↻ Reload.")
+        st.error(message)
+        with st.expander("What each stage did"):
+            for row in run.get("stages") or []:
+                icon = {True: "🟢", False: "🔴"}.get(row.get("ok"), "⚪")
+                detail = row.get("detail")
+                st.markdown(f"{icon} `{row.get('stage')}` — {row.get('action')}"
+                            + (f"  \n&nbsp;&nbsp;&nbsp;&nbsp;{detail}" if detail else ""),
+                            unsafe_allow_html=True)
+            st.caption(f"Recorded {run.get('generated_at') or 'unknown'} "
+                       f"in `run_status.json`.")
 
     stale = scan.stale_files
     if stale:

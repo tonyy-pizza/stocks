@@ -269,6 +269,19 @@ def render(scan):
                 f"Yes. Re-sized {result['checked']} candidate(s) at the scan's own "
                 f"parameters and got sized_candidates.json's adjusted ranges back, to "
                 f"the two decimals the file stores.{tail}")
+            text = result.get("text_mismatches") or []
+            if text:
+                # Numbers agree, wording does not. Almost always a file written
+                # by an older position_sizer - worth saying, not worth alarming
+                # about, and quite different from the sizing having drifted.
+                st.warning(
+                    f"The numbers agree, but the guide **text** differs for "
+                    f"{len(text)} candidate(s). That normally means "
+                    f"`sized_candidates.json` was written before "
+                    f"`apply_reduction()` last changed — re-run `scan_report.py` "
+                    f"and the wording will match. The percentages above are "
+                    f"correct either way.")
+                st.dataframe(pd.DataFrame(text), width="stretch", hide_index=True)
         else:
             st.error(f"Re-sizing at the scan's own parameters did not reproduce the "
                      f"file for {len(result['mismatches'])} of {result['checked']} "
@@ -280,4 +293,9 @@ def render(scan):
             "The simulator recomputes scale as correlation_scale × conviction_scale, "
             "which is what position_sizer.size_candidate() does. This check re-runs "
             "every candidate at the parameters the file was written with and compares "
-            "against the file.")
+            "against the file — both the percentages and the guide sentence. The "
+            "sentence is checked separately because a defect can live entirely in it: "
+            "apply_reduction() once scaled only the first percentage in a guide, so a "
+            "halved candidate read \"Core: 1.5%–2.5%; up to 8% with diversification\" "
+            "— right numbers, and an 8% ceiling quoted on a position cut to 2.5%. A "
+            "numbers-only check cannot see that.")

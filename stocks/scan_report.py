@@ -126,6 +126,7 @@ SCORED = DATA_DIR / "scored_candidates.json"
 SENTIMENT = DATA_DIR / "sentiment.json"
 CLUSTERED = DATA_DIR / "clustered.json"
 SIZED = DATA_DIR / "sized_candidates.json"
+RUN_STATUS = DATA_DIR / "run_status.json"
 ARCHIVE_DIR = DATA_DIR / "archive"
 
 # How many survivors get a sentiment pull, and how hard that stage is allowed
@@ -537,6 +538,36 @@ def run_pipeline(args):
     return status
 
 
+def write_run_status(status, args, output_path=RUN_STATUS):
+    """Record what each stage did, so a reader other than this terminal can see.
+
+    run_pipeline knows when a stage failed and says so on stdout, but that is
+    the only place it was ever said. stock_view reads this directory and had no
+    way to tell a scan that completed from one that halted at stage two and
+    left four stale files behind - which is exactly the situation where it most
+    needs to stop presenting them as today's numbers.
+    """
+    failed = [row for row in status if row.get("ok") is False]
+    blocking = [row for row in failed if row.get("required", True)]
+    document = {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "completed": not blocking,
+        "ok": not failed,
+        "stages": status,
+        "failed_stages": [row["stage"] for row in failed],
+        "blocking_stages": [row["stage"] for row in blocking],
+        "invocation": {
+            "force": bool(args.force),
+            "render_only": bool(args.render_only),
+            "include_canada": bool(args.include_canada),
+            "top": args.top,
+            "evaluate_limit": args.evaluate_limit,
+            "sentiment_top": args.sentiment_top,
+        },
+    }
+    return write_json(document, output_path)
+
+
 # ─── ARCHIVE ───────────────────────────────────────────────────────────────
 
 # Runs kept under data\archive\. Each is a full copy of the scan's five JSON
@@ -610,7 +641,7 @@ def archive_run(status, keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
     target.mkdir(parents=True, exist_ok=True)
 
     copied = []
-    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED):
+    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED, RUN_STATUS):
         if path.exists():
             try:
                 shutil.copy2(path, target / path.name)
@@ -943,6 +974,8 @@ def main(argv=None):
                   f"{DATA_DIR}{X}")
     else:
         status = run_pipeline(args)
+        # Before archiving, so the snapshot carries the run's own verdict.
+        write_run_status(status, args)
         if not args.no_archive:
             archive_run(status, keep=args.archive_keep, quiet=args.quiet)
 
