@@ -52,12 +52,38 @@ sidebar.
 
 ## Launch
 
-Double-click **`launch.bat`**, or:
+**Set it up once**, from the folder above this one:
 
 ```
-pip install -r requirements.txt
-streamlit run stock_view.py
+powershell -ExecutionPolicy Bypass -File setup_shortcuts.ps1
 ```
+
+That puts **Stock View** and **Run Stock Scan** on your Desktop and in the
+Start Menu, and from then on it is a double-click. `-ExecutionPolicy Bypass`
+applies to that one command only and changes no setting — Windows refuses to
+run unsigned `.ps1` files by default, and refuses quietly enough to look like a
+broken script.
+
+The shortcuts do not go through the `.bat` file association. Their target is
+`cmd.exe` with the script named as an argument, and an association only decides
+what happens when Windows is asked to *open* a file. Naming the interpreter
+outright skips that decision, so they still work on a machine where
+double-clicking a `.bat` opens an editor or does nothing at all — which is the
+usual reason a `.bat` "will not run" when the command inside it is fine.
+
+Failing that, double-click **`launch.bat`** directly, or:
+
+```
+py -m pip install -r requirements.txt
+py -m streamlit run stock_view.py
+```
+
+Use `py -m streamlit`, not bare `streamlit`. The `streamlit` command lives in
+Python's `Scripts\` folder, which is very often not on `PATH`; that is the
+`"streamlit is not recognized"` error, and it means the launcher is missing,
+not the package. Going through `py -m` runs the same program via the
+interpreter, which always works. `launch.bat` does it that way for the same
+reason, and offers to `pip install` the requirements if they are not there yet.
 
 Opening it before a scan has ever run is fine — it shows what is missing and
 what to run, rather than an error.
