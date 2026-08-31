@@ -148,6 +148,9 @@ HOLDINGS_TEMPLATE = {
 # "Core: 3%–5%; up to 8% with diversification." -> (3.0, 5.0)
 _PCT_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*[–—-]\s*(\d+(?:\.\d+)?)\s*%")
 
+# Every percentage in a guide string, ranges and standalone caps alike.
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
 
 def _num(value) -> Optional[float]:
     try:
@@ -317,15 +320,32 @@ def correlation_to_holdings(candidates, holding_tickers, lookback_years=None,
     meta["holdings_in_matrix"] = held_in_matrix
     meta["holdings_missing"] = [t for t in holding_tickers if t not in usable]
 
+    # A pair is only written when BOTH bases are finite numbers. A NaN reaching
+    # disk is worse than a missing pair: downstream it compares False against
+    # every threshold, so it survives the "is this correlated enough to cut"
+    # test and then drives a full-size reduction on a number nobody computed.
     correlations = {}
+    unusable = 0
     for candidate in candidates:
         if candidate not in usable:
             continue
-        correlations[candidate] = {
-            holding: {"cleaned": round(float(cleaned.loc[candidate, holding]), 4),
-                      "raw": round(float(raw.loc[candidate, holding]), 4)}
-            for holding in held_in_matrix if holding != candidate
-        }
+        pairs = {}
+        for holding in held_in_matrix:
+            if holding == candidate:
+                continue
+            clean_value = _num(cleaned.loc[candidate, holding])
+            raw_value = _num(raw.loc[candidate, holding])
+            if clean_value is None or raw_value is None:
+                unusable += 1
+                continue
+            pairs[holding] = {"cleaned": round(clean_value, 4),
+                              "raw": round(raw_value, 4)}
+        correlations[candidate] = pairs
+    if unusable:
+        meta["unusable_pairs"] = unusable
+        if not quiet:
+            print(f"  {unusable} candidate/holding pair(s) had no finite correlation "
+                  f"and were left out rather than written as NaN")
     return correlations, meta
 
 
@@ -402,12 +422,59 @@ def parse_guide_range(guide):
 
 
 def apply_reduction(guide, scale):
-    """Rewrite the guide string with the reduced range, keeping its wording."""
+    """Rewrite the guide string with every percentage in it scaled.
+
+    A guide is not only its range. "Core: 3%-5%; up to 8% with diversification."
+    carries a range AND a cap, and scaling only the first left the two halves
+    of one sentence disagreeing: a halved candidate read "Core: 1.5%-2.5%; up
+    to 8% with diversification", which quotes an 8% ceiling on a position the
+    correlation modifier had just cut to 2.5%.
+
+    Every percentage is scaled instead, and the separator is left exactly as
+    written rather than normalized, so the sentence comes back in its own
+    wording. "Avoid; research only." has no percentage and is returned as-is.
+    """
+    if not guide:
+        return guide
+
     def _sub(match):
-        low = float(match.group(1)) * scale
-        high = float(match.group(2)) * scale
-        return f"{low:.1f}%–{high:.1f}%"
-    return _PCT_RANGE_RE.sub(_sub, guide, count=1)
+        return f"{float(match.group(1)) * scale:.1f}%"
+
+    return _PCT_RE.sub(_sub, guide)
+
+
+def worst_correlation(pairs, basis):
+    """The holding a candidate is most correlated with, on the chosen basis.
+
+    Returns (holding, correlation), or (None, None) when nothing usable is
+    stored. Two things this has to get right, because the naive
+    max(pairs, key=lambda h: pairs[h].get(basis, 0.0)) got both wrong:
+
+      - A stored None. The default in .get() never fires (the key IS there,
+        its value is None), so max() happily returned that holding and the
+        caller compared None <= threshold, which is a TypeError that took the
+        whole sizing stage down.
+      - A stored NaN. Every comparison against NaN is False, so it slipped
+        past the threshold test and was handed to sizing_scale(), which cut
+        the position by the full reduction factor and wrote the reason out as
+        "correlation nan with holding X above 0.70".
+
+    Both are cases of "we do not know", and not knowing is not evidence that a
+    candidate duplicates a holding, so neither may drive a cut. Largest signed
+    correlation wins, not largest magnitude: a strongly negative correlation is
+    not a duplicate position.
+    """
+    usable = {}
+    for holding, values in (pairs or {}).items():
+        if not isinstance(values, dict):
+            continue
+        value = _num(values.get(basis))
+        if value is not None:
+            usable[holding] = value
+    if not usable:
+        return None, None
+    holding = max(usable, key=lambda h: usable[h])
+    return holding, usable[holding]
 
 
 def sizing_scale(correlation, threshold, reduction_factor, flat=False):
@@ -497,11 +564,15 @@ def size_candidate(ticker, record, cluster, holding, correlations,
         sizing["note"] = "no correlation to holdings available for this name"
         return finalize()
 
-    worst = max(pairs, key=lambda h: pairs[h].get(basis, 0.0))
-    worst_corr = pairs[worst].get(basis)
+    worst, worst_corr = worst_correlation(pairs, basis)
+    if worst is None:
+        sizing["note"] = (f"no usable {basis} correlation stored for this name "
+                          f"({len(pairs)} holding(s) compared, all missing or NaN)")
+        return finalize()
+
     sizing["max_correlation"] = worst_corr
-    sizing["max_correlation_raw"] = pairs[worst].get("raw")
-    sizing["max_correlation_cleaned"] = pairs[worst].get("cleaned")
+    sizing["max_correlation_raw"] = _num(pairs[worst].get("raw"))
+    sizing["max_correlation_cleaned"] = _num(pairs[worst].get("cleaned"))
 
     if worst_corr <= threshold:
         sizing["note"] = (f"no meaningful correlation to holdings (max {worst_corr:.2f} "
@@ -812,10 +883,12 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
               f"·  correlation-reduced {len(cut)}")
         for c in sorted(cut, key=lambda c: -(c["sizing"]["max_correlation"] or 0))[:12]:
             s = c["sizing"]
+            def _corr(value):
+                return "n/a" if value is None else f"{value:.2f}"
             print(f"    {c['ticker']:<8} {s['base_guide'].split(';')[0]:<28} -> "
                   f"{s['adjusted_guide'].split(';')[0]:<28} "
-                  f"(corr {s['max_correlation_raw']:.2f} raw / "
-                  f"{s['max_correlation_cleaned']:.2f} cleaned with {s['correlated_with']})")
+                  f"(corr {_corr(s['max_correlation_raw'])} raw / "
+                  f"{_corr(s['max_correlation_cleaned'])} cleaned with {s['correlated_with']})")
         for c in held:
             print(f"    {c['ticker']:<8} already held "
                   f"({c['holding'].get('shares')} sh @ {c['holding'].get('cost_basis')})")

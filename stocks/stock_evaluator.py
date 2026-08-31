@@ -3,6 +3,15 @@
 Stock Investment Evaluator v5.4 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
 
+v5.4.1 fixes (the first one DOES move composites — see below):
+- PEG is read again. yfinance dropped `pegRatio` from .info in favour of
+  `trailingPegRatio`, so m["peg"] had been None for every ticker: the report's
+  PEG row was permanently N/A and build_scores() always took the peg-excluded
+  weighting. Both key names are now read and m["peg_source"] records which one
+  answered. Composites shift slightly for any name Yahoo has a trailing PEG
+  for — that is the metric doing what it was always meant to do, but a scan
+  from before this change is not directly comparable with one after it.
+
 v5.4 changes vs v5.3 (all additive — the scoring math is untouched):
 - Adds batch mode: evaluate_universe() scores the candidate universe that
   universe_screen.py writes, and writes data/scored_candidates.json plus a
@@ -231,7 +240,18 @@ def calc_metrics(d):
     # Valuation
     m["pe"] = info.get("trailingPE")
     m["fwd_pe"] = info.get("forwardPE")
-    m["peg"] = info.get("pegRatio")
+    # PEG: yfinance dropped `pegRatio` from .info and now exposes the trailing
+    # figure as `trailingPegRatio`. Reading only the old key meant PEG was
+    # silently None for every ticker, so the valuation blend always took the
+    # peg-excluded branch and the report's PEG row was permanently N/A. Both
+    # keys are read, newest name last, and which one answered is recorded so a
+    # future rename is visible instead of quietly zeroing the metric again.
+    m["peg"], m["peg_source"] = None, None
+    for key in ("pegRatio", "trailingPegRatio"):
+        value = num(info.get(key))
+        if value is not None:
+            m["peg"], m["peg_source"] = value, key
+            break
     m["ps"] = info.get("priceToSalesTrailing12Months")
     m["pb"] = info.get("priceToBook")
     m["ev_ebitda"] = info.get("enterpriseToEbitda")

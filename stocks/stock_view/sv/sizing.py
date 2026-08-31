@@ -128,16 +128,14 @@ def controls_from_params(params: dict) -> Controls:
 def worst_pair(pairs: dict, basis: str):
     """The holding a candidate is most correlated with, on the chosen basis.
 
-    position_sizer picks with max(..., key=pairs[h][basis]) - the largest signed
-    correlation, not the largest magnitude. A strongly negative correlation is
-    not a duplicate position, so it should not be the one driving a cut.
+    This used to be a local reimplementation that happened to be right where
+    position_sizer's own selection was not - it filtered out stored None and
+    NaN correlations, which position_sizer then crashed or silently full-cut
+    on. That bug is fixed at source, so the rule now lives in exactly one
+    place and this defers to it, the same way the module defers to
+    sizing_scale() and apply_reduction() rather than deriving them again.
     """
-    usable = {h: _num(v.get(basis)) for h, v in (pairs or {}).items()
-              if isinstance(v, dict) and _num(v.get(basis)) is not None}
-    if not usable:
-        return None, None
-    holding = max(usable, key=lambda h: usable[h])
-    return holding, usable[holding]
+    return PIPELINE.worst_correlation(pairs, basis)
 
 
 def resize(candidate: dict, controls: Controls) -> Sized:
@@ -174,7 +172,9 @@ def resize(candidate: dict, controls: Controls) -> Sized:
         else:
             worst_holding, worst_corr = worst_pair(pairs, controls.basis)
             if worst_corr is None:
-                note = f"no {controls.basis} correlation stored for this name"
+                note = (f"no usable {controls.basis} correlation stored for this "
+                        f"name ({len(pairs)} holding(s) compared, all missing "
+                        f"or NaN)")
             elif worst_corr <= controls.threshold:
                 note = (f"no meaningful correlation to holdings (max {worst_corr:.2f} "
                         f"{controls.basis} with {worst_holding}, at or below "

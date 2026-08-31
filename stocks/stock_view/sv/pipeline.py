@@ -76,6 +76,7 @@ class Pipeline:
         self.sizing_scale = None        # position_sizer.sizing_scale
         self.apply_reduction = None     # position_sizer.apply_reduction
         self.parse_guide_range = None   # position_sizer.parse_guide_range
+        self.worst_correlation = None   # position_sizer.worst_correlation
         self.position_guidance = None   # stock_evaluator.position_guidance
         self.defaults = {
             # Mirrors of position_sizer's module constants, replaced by the real
@@ -100,7 +101,8 @@ class Pipeline:
             import market_data as md
             from position_sizer import (CORRELATION_BASIS, CORR_THRESHOLD,
                                         REDUCTION_FACTOR, apply_reduction,
-                                        parse_guide_range, sizing_scale)
+                                        parse_guide_range, sizing_scale,
+                                        worst_correlation)
             from stock_evaluator import position_guidance
         except Exception as exc:                      # noqa: BLE001
             self.error = (
@@ -118,6 +120,7 @@ class Pipeline:
         self.sizing_scale = sizing_scale
         self.apply_reduction = apply_reduction
         self.parse_guide_range = parse_guide_range
+        self.worst_correlation = worst_correlation
         self.position_guidance = position_guidance
         self.defaults = {
             "correlation_threshold": CORR_THRESHOLD,

@@ -86,10 +86,16 @@ candidates and holdings together, filtering it through Marchenko-Pastur — is
 already done and on disk. Moving a slider is arithmetic over data already in
 memory, so no refetch and no re-run is needed.
 
-The arithmetic is not reimplemented here. `sizing_scale()` and
-`apply_reduction()` are imported from `position_sizer.py`, and
-`position_guidance()` from `stock_evaluator.py`, so the simulator cannot drift
-from what the pipeline actually does.
+The arithmetic is not reimplemented here. `sizing_scale()`,
+`apply_reduction()` and `worst_correlation()` are imported from
+`position_sizer.py`, and `position_guidance()` from `stock_evaluator.py`, so the
+simulator cannot drift from what the pipeline actually does.
+
+`worst_correlation()` — which of a candidate's holdings drives its cut — used to
+be a local copy here. The copy happened to be the correct one: it skipped
+correlations stored as `null` or `NaN`, where `position_sizer` crashed on the
+first and applied a full-size cut on the second. That is fixed at source now, so
+the rule lives in one place and this imports it like the rest.
 
 One detail worth knowing, because a threshold-and-reduction sketch misses it:
 `position_sizer.size_candidate()` applies **two** independent modifiers and

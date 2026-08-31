@@ -498,6 +498,40 @@ def get_price_history(ticker: str,
                         force_refresh=force_refresh)
 
 
+def _close_frame(frame, chunk):
+    """The Close block of a yf.download() result, always as a DataFrame.
+
+    yfinance changes shape with the number of tickers: several tickers give
+    MultiIndex columns and frame["Close"] is a DataFrame keyed by symbol, but a
+    single ticker gives flat columns and frame["Close"] is a *Series* with no
+    .columns at all. A chunk of one is not exotic - it is simply what the last
+    chunk looks like when the universe size leaves a remainder of one - and
+    without this the Series raised AttributeError inside the fetch, burned all
+    four retries, and dropped the chunk with "price chunk failed".
+
+    Returns None when there is no Close block to read.
+    """
+    columns = getattr(frame, "columns", None)
+    if columns is None:
+        return None
+    try:
+        has_close = "Close" in columns.get_level_values(0)
+    except Exception:
+        has_close = "Close" in list(columns)
+    if not has_close:
+        return None
+
+    closes = frame["Close"]
+    if not hasattr(closes, "columns"):
+        # A Series. Its .name is the column label ("Close"), not the symbol, so
+        # the ticker has to come from the chunk we asked for - unless yfinance
+        # did label it with a symbol, which some versions do.
+        label = closes.name if isinstance(closes.name, str) else None
+        symbol = label if label in chunk else chunk[0]
+        return closes.to_frame(name=symbol)
+    return closes
+
+
 def download_prices(tickers,
                     period: str = "1y",
                     interval: str = "1d",
@@ -533,7 +567,7 @@ def download_prices(tickers,
                                 session=get_session())
             if frame is None or frame.empty:
                 raise ValueError(f"empty download for {len(chunk)} tickers ({period})")
-            closes = frame["Close"] if "Close" in frame.columns.get_level_values(0) else None
+            closes = _close_frame(frame, chunk)
             if closes is None or closes.empty:
                 raise ValueError(f"no Close column for {len(chunk)} tickers ({period})")
             dates = [d.strftime("%Y-%m-%d") for d in closes.index]
