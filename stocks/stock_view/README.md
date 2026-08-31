@@ -40,7 +40,7 @@ C:\Users\joey\stocks\
         sv\
 ```
 
-It finds the pipeline using the same `_add_script_dir_to_path()` search the
+It finds the pipeline using the same `_add_project_dir_to_path()` search the
 other scripts use, widened by one level because it sits in a subfolder: it looks
 at `$STOCKS_DIR`, then its own folder, then the folder above it, then a `stocks\`
 folder beside either. If you keep it somewhere else entirely, set `STOCKS_DIR`
@@ -150,6 +150,13 @@ relationship the sizing simulator actually acts on.
   mix named. A selection spanning currencies says so.
 
 ## Files
+
+`sv/` deliberately does **not** import `stocks_common.py`, which the pipeline
+scripts share for paths, atomic writes and number coercion. Every view that only
+reads JSON has to work with nothing installed but streamlit, pandas and plotly,
+and it cannot import a pipeline module to find out how to parse a number. The
+two small `_num` copies in `sv/` are the price of that guarantee and are kept on
+purpose; the sizing math, which genuinely must not drift, is imported.
 
 ```
 stock_view.py            entry point: page setup, sidebar, view router

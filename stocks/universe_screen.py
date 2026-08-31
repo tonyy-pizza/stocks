@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 import market_data as md
+import stocks_common as common     # importable: market_data put this folder on sys.path
 from yfinance import EquityQuery   # query construction only - no network here
 
 
@@ -64,7 +65,7 @@ from yfinance import EquityQuery   # query construction only - no network here
 # -------------------------------------------------------------------------
 
 # Sits next to market_data.py, so C:\Users\joey\stocks\data\candidates.json.
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (md.BASE_DIR / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 OUTPUT_PATH = DATA_DIR / "candidates.json"
 
 # Loose by design. Every one of these is an "obviously not worth analysing"
@@ -119,12 +120,7 @@ def yahoo_sectors() -> list:
         return list(FALLBACK_SECTORS)
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # -------------------------------------------------------------------------
@@ -355,11 +351,7 @@ def partial_failure(stats: list, max_failure_rate: float = DEFAULT_MAX_FAILURE_R
 
 def previous_run_stamp(output_path: Path) -> Optional[str]:
     """generated_at of the file already on disk, for the abort message."""
-    try:
-        with open(output_path, "r", encoding="utf-8") as f:
-            return json.load(f).get("generated_at")
-    except Exception:
-        return None
+    return (common.read_json(output_path) or {}).get("generated_at")
 
 
 def write_candidates(candidates: list,
@@ -380,20 +372,7 @@ def write_candidates(candidates: list,
         "dropped_duplicates": dropped,
         "candidates": candidates,
     }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path)
 
 
 # -------------------------------------------------------------------------

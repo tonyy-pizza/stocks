@@ -25,7 +25,15 @@ when Reddit rate-limits, is reported, and does not halt anything.
 Nothing here re-implements a stage. Each is invoked through its own entry
 point (universe_screen.main, stock_evaluator.batch_main, rmt_cluster.main,
 position_sizer.main), and --detail hands off to stock_evaluator's existing
-single-ticker report.
+single-ticker report. Paths, atomic JSON writes and number coercion come from
+stocks_common.py rather than being copied in.
+
+Every completed run is snapshotted to data\archive\<timestamp>\, and the
+newest --archive-keep of those are retained (30 by default). A snapshot is a
+full copy of the five JSON files and scored_candidates.json alone runs to tens
+of megabytes on a few-thousand-name universe, so without a bound the archive
+becomes the largest thing in the project. Only the most recent run is ever read
+back, by position_sizer's exit review.
 
 Setup:
     pip install yfinance curl_cffi requests numpy pandas
@@ -45,6 +53,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -52,7 +61,9 @@ from pathlib import Path
 from typing import Optional
 
 
-def _add_script_dir_to_path():
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
+def _add_project_dir_to_path():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
         if (candidate / "market_data.py").exists():
@@ -64,9 +75,10 @@ def _add_script_dir_to_path():
     return here
 
 
-SCRIPT_DIR = _add_script_dir_to_path()
+SCRIPT_DIR = _add_project_dir_to_path()
 
 import market_data as md                     # noqa: E402
+import stocks_common as common               # noqa: E402
 import universe_screen                       # noqa: E402
 import stock_evaluator                       # noqa: E402
 import rmt_cluster                           # noqa: E402
@@ -107,7 +119,7 @@ def h(text):
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 
 CANDIDATES = DATA_DIR / "candidates.json"
 SCORED = DATA_DIR / "scored_candidates.json"
@@ -152,22 +164,12 @@ SECTOR_ETF_CA = {
 DISCLAIMER = "⚠  For informational use only. Not financial advice."
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # ─── FRESHNESS ─────────────────────────────────────────────────────────────
 
-def read_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+read_json = common.read_json
 
 
 def file_age_seconds(path):
@@ -359,13 +361,7 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
 
 
 def write_json(document, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(document, f, indent=2, ensure_ascii=False, default=str)
-    os.replace(tmp, output_path)
-    return output_path
+    return common.write_json(document, output_path, default=str)
 
 
 # ─── PIPELINE ──────────────────────────────────────────────────────────────
@@ -493,6 +489,8 @@ def run_pipeline(args):
         if args.account_size:
             argv += ["--account-size", str(args.account_size),
                      "--account-currency", str(args.account_currency)]
+        if args.workers:
+            argv += ["--workers", str(args.workers)]
         if args.refresh_prices:
             argv.append("--refresh")
         return stock_evaluator.batch_main(argv)
@@ -541,7 +539,43 @@ def run_pipeline(args):
 
 # ─── ARCHIVE ───────────────────────────────────────────────────────────────
 
-def archive_run(status, quiet=False):
+# Runs kept under data\archive\. Each is a full copy of the scan's five JSON
+# files, and scored_candidates.json alone runs to tens of megabytes on a
+# few-thousand-name universe, so an unbounded archive quietly becomes the
+# largest thing in the project. The exit review only ever reads the most
+# recent one; the rest are history, and a month of it is plenty.
+DEFAULT_ARCHIVE_KEEP = 30
+
+# data\archive\2026-08-31T02-19-07 - only folders this shape are ever pruned,
+# so anything a person filed there by hand is left alone.
+_ARCHIVE_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
+
+
+def prune_archive(keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
+    """Delete all but the newest `keep` archived runs. Returns how many went.
+
+    Names sort chronologically because the stamp is ISO-ordered, so the newest
+    are simply the last ones. keep=0 or None disables pruning entirely.
+    """
+    if not keep or keep <= 0 or not ARCHIVE_DIR.is_dir():
+        return 0
+    runs = sorted(d for d in ARCHIVE_DIR.iterdir()
+                  if d.is_dir() and _ARCHIVE_STAMP_RE.match(d.name))
+    stale = runs[:-keep] if len(runs) > keep else []
+    removed = 0
+    for run in stale:
+        try:
+            shutil.rmtree(run)
+            removed += 1
+        except OSError as e:
+            if not quiet:
+                print(f"  {Y}could not prune archive/{run.name}: {e}{X}")
+    if removed and not quiet:
+        print(f"  {D}pruned {removed} archived run(s), keeping the newest {keep}{X}")
+    return removed
+
+
+def archive_run(status, keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
     """Snapshot this run's outputs to data\\archive\\<timestamp>\\.
 
     Only when something actually re-ran - re-rendering yesterday's files does
@@ -592,6 +626,7 @@ def archive_run(status, quiet=False):
         return None
     if not quiet:
         print(f"  {D}archived {len(copied)} file(s) to archive/{stamp}{X}")
+    prune_archive(keep=keep, quiet=quiet)
     return target
 
 
@@ -879,6 +914,13 @@ def main(argv=None):
                              f"(default {SENTIMENT_TOP})")
     parser.add_argument("--no-archive", action="store_true",
                         help="do not snapshot this run to data/archive/<timestamp>/")
+    parser.add_argument("--archive-keep", type=int, default=DEFAULT_ARCHIVE_KEEP,
+                        metavar="N",
+                        help=f"how many archived runs to keep (default "
+                             f"{DEFAULT_ARCHIVE_KEEP}; 0 keeps every one)")
+    parser.add_argument("--workers", type=int, metavar="N",
+                        help="score N tickers at once in the evaluator stage "
+                             "(default 1; Yahoo rate-limits, so raise it carefully)")
     parser.add_argument("--show-stages", action="store_true",
                         help="list each stage's action in the report footer")
     parser.add_argument("--quiet", action="store_true", help="suppress stage progress")
@@ -902,7 +944,7 @@ def main(argv=None):
     else:
         status = run_pipeline(args)
         if not args.no_archive:
-            archive_run(status, quiet=args.quiet)
+            archive_run(status, keep=args.archive_keep, quiet=args.quiet)
 
     sized_doc = read_json(SIZED)
     if sized_doc is None:

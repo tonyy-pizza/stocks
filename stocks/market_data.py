@@ -41,7 +41,6 @@ import os
 import random
 import re
 import sys
-import tempfile
 import threading
 import time
 import unicodedata
@@ -50,6 +49,14 @@ from typing import Any, Callable, Iterable, Optional
 
 import requests
 import yfinance as yf
+
+# stocks_common owns BASE_DIR, num() and the atomic JSON write. It imports
+# nothing from this project, so it sits below market_data rather than beside
+# it and there is no cycle.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import stocks_common as common
 
 try:
     from curl_cffi import requests as curl_requests
@@ -61,10 +68,10 @@ except ImportError:
 # CONFIG
 # -------------------------------------------------------------------------
 
-# Project root. On the machine this was written for that resolves to
-# C:\Users\joey\stocks, because this file lives there - the cache always
-# sits next to the code. Override with STOCKS_DIR / STOCKS_CACHE_DIR.
-BASE_DIR  = Path(os.environ.get("STOCKS_DIR") or Path(__file__).resolve().parent)
+# Project root, from stocks_common. Re-exported under this name because
+# market_data.BASE_DIR is what the rest of the project and stock_view ask for.
+# Override with STOCKS_DIR / STOCKS_CACHE_DIR.
+BASE_DIR  = common.BASE_DIR
 CACHE_DIR = Path(os.environ.get("STOCKS_CACHE_DIR") or (BASE_DIR / "cache"))
 
 # Cache subfolders, one per kind of data. cached_fetch() writes into one of
@@ -99,8 +106,11 @@ _BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Set by cached_fetch() on every call; read it via was_cache_hit().
-LAST_CACHE_HIT: Optional[bool] = None
+# Set by cached_fetch() on every call; read it via was_cache_hit(). Held per
+# THREAD rather than per process: it is a "what did my last call just do"
+# flag, and a module global would have each worker in a concurrent batch
+# overwriting the answer the others were about to read.
+_CACHE_HIT = threading.local()
 
 
 def _log(msg: str) -> None:
@@ -116,24 +126,33 @@ def _warn(msg: str) -> None:
 # SESSION
 # -------------------------------------------------------------------------
 
-_SESSION = None
+_SESSIONS = threading.local()
+_ALL_SESSIONS = []
 _SESSION_LOCK = threading.Lock()
 
 
 def get_session():
-    """Return the process-wide HTTP session, building it on first use.
+    """Return this thread's HTTP session, building it on first use.
 
     curl_cffi (browser TLS fingerprint) when available, otherwise a plain
     requests.Session with a browser User-Agent. Connection pooling is the
     point: repeated calls reuse sockets instead of reopening TLS every time.
     Both types are accepted by yfinance.
+
+    One session PER THREAD, not one per process. Neither curl_cffi's Session
+    nor requests' is guaranteed safe for concurrent use, and the batch
+    evaluator can now run several workers. A session each keeps the pooling
+    benefit - a worker still reuses its own sockets across hundreds of calls -
+    without two threads sharing one connection pool. Single-threaded callers,
+    which is still the default everywhere, see exactly one session as before.
     """
-    global _SESSION
-    if _SESSION is None:
+    session = getattr(_SESSIONS, "session", None)
+    if session is None:
+        session = _build_session()
+        _SESSIONS.session = session
         with _SESSION_LOCK:
-            if _SESSION is None:
-                _SESSION = _build_session()
-    return _SESSION
+            _ALL_SESSIONS.append(session)
+    return session
 
 
 def _build_session():
@@ -155,15 +174,19 @@ def _build_session():
 
 
 def reset_session():
-    """Drop the pooled session (call after a long idle or a proxy change)."""
-    global _SESSION
+    """Close every thread's pooled session (after a long idle or proxy change).
+
+    Threads that already have one drop it lazily: this clears the calling
+    thread's immediately and closes the rest, so each rebuilds on next use.
+    """
     with _SESSION_LOCK:
-        if _SESSION is not None:
+        for session in _ALL_SESSIONS:
             try:
-                _SESSION.close()
+                session.close()
             except Exception:
                 pass
-        _SESSION = None
+        _ALL_SESSIONS.clear()
+    _SESSIONS.session = None
 
 
 def get_ticker(symbol: str):
@@ -209,25 +232,7 @@ def cache_path(cache_key: str, cache_type: Optional[str] = None) -> Path:
     return directory / f"{_slug(key)}.json"
 
 
-def _json_default(obj):
-    """Last-resort encoder: pandas/numpy scalars and timestamps -> JSON."""
-    if isinstance(obj, (dt.datetime, dt.date, dt.time)):
-        return obj.isoformat()
-    if isinstance(obj, (set, frozenset, tuple)):
-        return list(obj)
-    item = getattr(obj, "item", None)          # numpy scalar
-    if callable(item):
-        try:
-            return item()
-        except Exception:
-            pass
-    to_dict = getattr(obj, "to_dict", None)    # pandas Series/DataFrame
-    if callable(to_dict):
-        try:
-            return to_dict()
-        except Exception:
-            pass
-    return str(obj)
+_json_default = common.json_default
 
 
 def _read_cache_entry(path: Path) -> Optional[dict]:
@@ -256,21 +261,17 @@ def _entry_age(entry: Optional[dict]) -> Optional[float]:
 
 
 def _write_cache_entry(path: Path, data: Any) -> None:
-    """Atomic write (tmp file + replace) so a killed run never leaves a
-    half-written cache file behind."""
+    """Atomic write so a killed run never leaves a half-written cache file.
+
+    A cache write that fails is a warning, not an error: the value was already
+    fetched and returned, and the only cost of not storing it is fetching it
+    again next time.
+    """
     entry = {"timestamp": dt.datetime.now().isoformat(timespec="seconds"), "data": data}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(entry, f, indent=2, ensure_ascii=False, default=_json_default)
-        os.replace(tmp_path, path)
+        common.write_json(entry, path, default=_json_default)
     except Exception as e:
         _warn(f"could not write cache {path.name}: {e}")
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def cached_fetch(cache_key: str,
@@ -289,18 +290,16 @@ def cached_fetch(cache_key: str,
     Returns None only when there is no fresh cache AND the fetch failed AND
     no stale entry exists to fall back on. Never raises for a fetch failure.
     """
-    global LAST_CACHE_HIT
-
     path = cache_path(cache_key, cache_type)
     entry = _read_cache_entry(path)
     age = _entry_age(entry)
 
     if entry is not None and age is not None and age < ttl_seconds and not force_refresh:
-        LAST_CACHE_HIT = True
+        _CACHE_HIT.value = True
         _log(f"HIT  {path.parent.name}/{path.name} (age {age:.0f}s < ttl {ttl_seconds:.0f}s)")
         return entry.get("data")
 
-    LAST_CACHE_HIT = False
+    _CACHE_HIT.value = False
     reason = "forced" if force_refresh else ("stale" if entry is not None else "absent")
     _log(f"MISS {path.parent.name}/{path.name} ({reason}) - fetching")
 
@@ -323,8 +322,13 @@ def cached_fetch(cache_key: str,
 
 
 def was_cache_hit() -> Optional[bool]:
-    """True if the most recent cached_fetch() was served from disk."""
-    return LAST_CACHE_HIT
+    """True if THIS THREAD's most recent cached_fetch() was served from disk.
+
+    None when this thread has not called cached_fetch() yet - which is also
+    what a worker thread sees before its first fetch, rather than another
+    thread's leftover answer.
+    """
+    return getattr(_CACHE_HIT, "value", None)
 
 
 def cache_timestamp(cache_key: str, cache_type: Optional[str] = None) -> Optional[str]:
@@ -453,12 +457,7 @@ def get_info(ticker: str, ttl: float = TTL_FINANCIALS, force_refresh: bool = Fal
                         force_refresh=force_refresh)
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 def _history_to_rows(hist) -> list:

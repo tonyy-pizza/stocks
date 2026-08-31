@@ -52,20 +52,21 @@ import numpy as np
 import pandas as pd
 
 
-def _add_script_dir_to_path():
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
+def _add_project_dir_to_path():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
         if (candidate / "market_data.py").exists():
             if str(candidate) not in sys.path:
                 sys.path.insert(0, str(candidate))
             return
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
 
 
-_add_script_dir_to_path()
+_add_project_dir_to_path()
 
 import market_data as md                                   # noqa: E402
+import stocks_common as common                             # noqa: E402
 import rmt_cluster as rc                                    # noqa: E402
 from stock_evaluator import (position_guidance, score_candidate,      # noqa: E402
                              G, Y, R, X)                              # same palette
@@ -75,7 +76,7 @@ from stock_evaluator import (position_guidance, score_candidate,      # noqa: E4
 # CONFIG
 # -------------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 HOLDINGS_PATH = DATA_DIR / "holdings.json"
 SCORED_PATH = DATA_DIR / "scored_candidates.json"
 CLUSTERED_PATH = DATA_DIR / "clustered.json"
@@ -152,12 +153,7 @@ _PCT_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*[–—-]\s*(\d+(?:\.\d+)?)\s
 _PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # -------------------------------------------------------------------------
@@ -606,14 +602,7 @@ def latest_archive_scores(data_dir=None):
         return {}, None
     runs = sorted((d for d in archive.iterdir() if d.is_dir()), reverse=True)
     for run in runs:
-        document = None
-        path = run / "sized_candidates.json"
-        if path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    document = json.load(f)
-            except Exception:
-                document = None
+        document = common.read_json(run / "sized_candidates.json")
         if not document:
             continue
         scores = {}
@@ -737,20 +726,7 @@ def review_holdings(holdings, scored_records=None, previous=None,
 # -------------------------------------------------------------------------
 
 def write_json(document, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False, default=str)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path, default=str)
 
 
 def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,

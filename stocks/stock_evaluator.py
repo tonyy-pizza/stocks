@@ -3,6 +3,19 @@
 Stock Investment Evaluator v5.4 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
 
+v5.4.3 — structure and cost, no change to any score:
+- Paths, the atomic JSON write, number coercion and the JSON encoder come from
+  stocks_common.py instead of being copied into every stage.
+- Batch mode no longer fetches a year of daily OHLCV per ticker. calc_metrics
+  used it for one thing — filling in the 52-week range when info lacks it —
+  and info almost always carries it, so that was a request and a cache file
+  per name for a fallback that hardly ever fires. It is fetched only when the
+  fallback is actually needed.
+- --workers scores several tickers at once. It defaults to 1 on purpose: Yahoo
+  rate-limits an unauthenticated client and backoff sleeps can make a parallel
+  run slower than a serial one. Results are collected in input order, so the
+  output file does not change shape with the setting.
+
 v5.4.2 — the analysis-logic pass. These change which names surface, not just
 which numbers are printed, so a scan from before is not comparable with one
 after:
@@ -1030,6 +1043,8 @@ from pathlib import Path
 
 # market_data.py sits next to this script on the working machine
 # (C:\Users\joey\stocks\), and in stocks/ when this repo is checked out.
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
 def _import_market_data():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
@@ -1038,12 +1053,13 @@ def _import_market_data():
                 sys.path.insert(0, str(candidate))
             break
     import market_data
-    return market_data
+    import stocks_common
+    return market_data, stocks_common
 
 try:
-    md = _import_market_data()
+    md, common = _import_market_data()
 except Exception as _md_err:      # single-ticker mode must not care
-    md = None
+    md = common = None
     _MD_IMPORT_ERROR = _md_err
 else:
     _MD_IMPORT_ERROR = None
@@ -1052,6 +1068,14 @@ else:
 # dollar volume is worth flagging, not excluding.
 DEFAULT_POSITION_PCT = 0.03
 DEFAULT_MAX_ADV_PCT  = 0.01
+
+# Tickers scored at once in batch mode. One by default - see evaluate_universe
+# for why more is a judgement call rather than a free speed-up.
+DEFAULT_WORKERS = 1
+
+# Guards the per-run FX rate cache when several workers share it.
+import threading as _threading
+_FX_LOCK = _threading.Lock()
 
 # "Bottom of the 52-week range" for the divergence check.
 DIVERGENCE_LOW_POS = 0.25
@@ -1065,12 +1089,16 @@ INSUFFICIENT = "insufficient history"
 
 
 def data_dir():
-    """<stocks>\\data — the same directory universe_screen.py writes to."""
-    override = os.environ.get("STOCKS_DATA_DIR")
-    if override:
-        return Path(override)
+    """<stocks>\\data — the same directory universe_screen.py writes to.
+
+    Falls back to this file's own folder when market_data could not be
+    imported, so the single-ticker path never depends on the batch layer.
+    """
     base = Path(md.BASE_DIR) if md is not None else Path(__file__).resolve().parent
-    return base / "data"
+    if common is not None:
+        return common.data_dir(base)
+    override = os.environ.get("STOCKS_DATA_DIR")
+    return Path(override) if override else base / "data"
 
 
 def _require_market_data():
@@ -1188,7 +1216,16 @@ def get_data_cached(ticker, include_insider=False, force_refresh=False):
         payload = fetch_insider(ticker, force_refresh=force_refresh)
         insider = _payload_to_frame(payload) if payload else None
 
-    history = _history_frame(md.get_price_history(ticker, period="1y"))
+    # A year of daily OHLCV is one request and a sizeable cache file per
+    # ticker, and calc_metrics uses it for exactly one thing: filling in the
+    # 52-week high/low when info does not carry them. info almost always does,
+    # so the batch was paying that request for every name in the universe to
+    # cover a fallback that hardly ever fires. Fetch it only when the fallback
+    # is actually needed - the condition below is calc_metrics' own.
+    needs_history = not (num(info.get("fiftyTwoWeekHigh"))
+                         and num(info.get("fiftyTwoWeekLow")))
+    history = (_history_frame(md.get_price_history(ticker, period="1y"))
+               if needs_history else None)
 
     return {
         "ticker": ticker.upper(),
@@ -1561,9 +1598,15 @@ def fx_rate_for(quote_currency, account_currency, cache=None):
     key = (quote, account)
     if cache is None:
         return md.get_fx_rate(quote, account)
-    if key not in cache:
-        cache[key] = md.get_fx_rate(quote, account)
-    return cache[key]
+    # Held across the fetch so several workers hitting a currency for the first
+    # time make one request between them rather than one each. The lock is not
+    # a correctness problem for the rate itself - the fetch is idempotent and
+    # disk-cached - it just stops a batch of Canadian names from opening the
+    # same conversation with Yahoo N times at once.
+    with _FX_LOCK:
+        if key not in cache:
+            cache[key] = md.get_fx_rate(quote, account)
+        return cache[key]
 
 
 def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT,
@@ -1659,40 +1702,20 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
 
 # ─── BATCH RUN ─────────────────────────────────────────────────────────────
 def _json_default(o):
-    if isinstance(o, datetime):
-        return o.isoformat()
-    item = getattr(o, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except Exception:
-            pass
-    return str(o)
+    """stocks_common's encoder; batch mode always has it, since it needs md."""
+    return common.json_default(o)
 
 
 def _write_json(document, output_path):
     """Atomic write, so a reader never sees a half-written scan."""
-    import tempfile
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False, default=_json_default)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path, default=common.json_default)
 
 
 def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                       position_pct=DEFAULT_POSITION_PCT, max_adv_pct=DEFAULT_MAX_ADV_PCT,
                       account_currency="USD", limit=None, sectors=None,
-                      include_insider=False, force_refresh=False, quiet=False):
+                      include_insider=False, force_refresh=False, quiet=False,
+                      workers=DEFAULT_WORKERS):
     """Score every candidate from Stage 0 into data\\scored_candidates.json.
 
     Reads the candidates.json universe_screen.py writes, runs each ticker
@@ -1700,6 +1723,18 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
     writes every successful record plus a "skipped" list of the tickers that
     failed and why. A ticker that cannot be fetched or scored is logged and
     stepped over - the batch always finishes.
+
+    `workers` runs several tickers at once. It defaults to 1, and that default
+    is a judgement, not laziness: market_data exists so "Yahoo sees one
+    well-behaved client", and an unauthenticated client that opens eight
+    parallel conversations with Yahoo gets rate-limited, at which point
+    fetch_with_backoff starts sleeping and the run can finish slower than it
+    would have serially. 2-4 is a reasonable place to experiment; the disk
+    cache already makes the second run of a day nearly free, which is the
+    cheaper way to get the same time back.
+
+    Results are collected in input order however many workers are used, so the
+    output file does not change shape with the setting.
     """
     _require_market_data()
 
@@ -1730,12 +1765,11 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                   f"{max_adv_pct*100:.0f}% of average daily dollar volume")
         print()
 
-    for i, candidate in enumerate(candidates, 1):
+    def _score(candidate):
+        """One candidate -> (ticker, record, reason). Never raises."""
         ticker = str(candidate.get("ticker") or "").strip().upper()
         if not ticker:
-            skipped.append({"ticker": None, "reason": "candidate row has no ticker"})
-            continue
-
+            return None, None, "candidate row has no ticker"
         record, reason = score_candidate(
             ticker,
             account_size=account_size, position_pct=position_pct,
@@ -1743,22 +1777,47 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             avg_volume_hint=candidate.get("avg_volume"),
             include_insider=include_insider, force_refresh=force_refresh,
             fx_cache=fx_cache)
+        return ticker, record, reason
 
-        if record is None:
-            skipped.append({"ticker": ticker, "reason": reason})
-            if not quiet:
-                print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
-            continue
-
-        scored.append(record)
+    workers = max(1, int(workers or 1))
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=workers)
+        # .map yields in submission order, so a run with workers=8 writes the
+        # same file in the same order as a run with workers=1.
+        results = pool.map(_score, candidates)
         if not quiet:
-            flags = []
-            if record["liquidity_flag"]:
-                flags.append("thin")
-            if record["divergence_pattern"] != "neutral":
-                flags.append(record["divergence_pattern"])
-            suffix = f"  [{', '.join(flags)}]" if flags else ""
-            print(f"  [{i:>4}/{total}] {ticker:<10} {colour(record['composite'])} / 10{suffix}")
+            print(f"  {workers} workers (market_data gives each its own session)\n")
+    else:
+        pool = None
+        results = (_score(candidate) for candidate in candidates)
+
+    try:
+        for i, (ticker, record, reason) in enumerate(results, 1):
+            if ticker is None:
+                skipped.append({"ticker": None, "reason": reason})
+                continue
+
+            if record is None:
+                skipped.append({"ticker": ticker, "reason": reason})
+                if not quiet:
+                    print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
+                continue
+
+            scored.append(record)
+            if not quiet:
+                flags = []
+                if record["liquidity_flag"]:
+                    flags.append("thin")
+                if record["divergence_pattern"] != "neutral":
+                    flags.append(record["divergence_pattern"])
+                suffix = f"  [{', '.join(flags)}]" if flags else ""
+                print(f"  [{i:>4}/{total}] {ticker:<10} "
+                      f"{colour(record['composite'])} / 10{suffix}")
+    finally:
+        if pool is not None:
+            # Ctrl-C mid-batch should not leave worker threads running.
+            pool.shutdown(wait=True)
 
     document = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1772,6 +1831,7 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             "sectors": sorted(sectors) if sectors else None,
             "limit": limit,
             "include_insider": include_insider,
+            "workers": workers,
             # Which rates the liquidity gate actually converted at, so a run is
             # reproducible and an un-convertible currency is visible as a null
             # rather than as a silently unconverted comparison.
@@ -1833,6 +1893,11 @@ def batch_main(argv):
     parser.add_argument("--limit", type=int, help="score only the first N candidates")
     parser.add_argument("--insider", action="store_true",
                         help="also pull insider transactions (one extra request per ticker)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
+                        help=f"score N tickers at once (default {DEFAULT_WORKERS}). "
+                             f"Yahoo rate-limits an unauthenticated client, and "
+                             f"backoff sleeps can make a parallel run slower than a "
+                             f"serial one - raise this deliberately, 2-4 first")
     parser.add_argument("--refresh", action="store_true", help="ignore cached data and refetch")
     parser.add_argument("--quiet", action="store_true", help="only print the summary")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1852,7 +1917,7 @@ def batch_main(argv):
                           max_adv_pct=args.max_adv_pct, account_currency=args.account_currency,
                           limit=args.limit, sectors=args.sectors,
                           include_insider=args.insider, force_refresh=args.refresh,
-                          quiet=args.quiet)
+                          quiet=args.quiet, workers=args.workers)
     except FileNotFoundError as e:
         print(f"\n  {R}Candidate universe not found: {e}{X}")
         print("  Run universe_screen.py first to build data/candidates.json.\n")
