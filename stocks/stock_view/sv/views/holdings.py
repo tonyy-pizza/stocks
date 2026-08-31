@@ -28,16 +28,16 @@ def _verdict_css(value):
 def _cost_basis_by_currency(rows, scan):
     """Cost basis totalled per currency, never across them.
 
-    holdings.json records no currency — just ticker, shares and cost_basis in
-    "the listing's own currency". A single total over a mix of TSX and US names
-    would be adding CAD to USD, so the currency is inferred per name (from the
-    scan's own quote_currency where it knows it) and each one is totalled
-    separately.
+    A single total over a mix of TSX and US names would be adding CAD to USD, so
+    each currency is totalled separately. The currency comes from the holding's
+    own `currency` field when it declares one, else from the scan's
+    quote_currency, else from a Canadian ticker suffix - and stays "unknown"
+    when none of those can say, rather than being folded into a total.
     """
     totals = {}
     for row in rows:
         shares, cost = row.get("shares"), row.get("cost_basis")
-        currency = dl.infer_currency(row["ticker"], scan) or "unknown"
+        currency = dl.infer_currency(row["ticker"], scan, row.get("currency")) or "unknown"
         entry = totals.setdefault(currency, {"value": 0.0, "names": [],
                                              "incomplete": []})
         entry["names"].append(row["ticker"])
@@ -82,7 +82,7 @@ def render(scan):
     rows = []
     for row in kept:
         ticker = row["ticker"]
-        currency = dl.infer_currency(ticker, scan)
+        currency = dl.infer_currency(ticker, scan, row.get("currency"))
         shares, cost = row.get("shares"), row.get("cost_basis")
         candidate = next((c for c in scan.candidates if c.get("ticker") == ticker), None)
         rows.append({
@@ -163,7 +163,9 @@ def render(scan):
             "Composite": d.num(review.get("composite")),
             "Δ since last scan": d.num(review.get("composite_delta")),
             "Rating": review.get("rating"),
+            "ROA trend": review.get("roa_trend"),
             "Debt trend": review.get("debt_trend"),
+            "Data": d.num(review.get("data_coverage")),
             "Why": reasons[0] if reasons else "",
         })
     review_frame = pd.DataFrame(rows)
@@ -171,9 +173,15 @@ def render(scan):
         review_frame.style
         .map(d.score_css, subset=["Composite"])
         .map(_verdict_css, subset=["Verdict"])
+        .map(d.coverage_css, subset=["Data"])
         .format({"Composite": lambda v: "n/a" if pd.isna(v) else f"{v:.2f}",
-                 "Δ since last scan": lambda v: "—" if pd.isna(v) else f"{v:+.2f}"}),
-        width="stretch", hide_index=True)
+                 "Δ since last scan": lambda v: "—" if pd.isna(v) else f"{v:+.2f}",
+                 "Data": lambda v: "n/a" if pd.isna(v) else f"{v * 100:.0f}%"}),
+        width="stretch", hide_index=True,
+        column_config={
+            "ROA trend": st.column_config.Column("ROA trend", help=d.TREND_HELP),
+            "Data": st.column_config.Column("Data", help=d.COVERAGE_HELP),
+        })
 
     flagged = [r for r in reviews if r.get("verdict") == "exit_review"]
     if flagged:

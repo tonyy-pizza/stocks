@@ -52,20 +52,21 @@ import numpy as np
 import pandas as pd
 
 
-def _add_script_dir_to_path():
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
+def _add_project_dir_to_path():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
         if (candidate / "market_data.py").exists():
             if str(candidate) not in sys.path:
                 sys.path.insert(0, str(candidate))
             return
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
 
 
-_add_script_dir_to_path()
+_add_project_dir_to_path()
 
 import market_data as md                                   # noqa: E402
+import stocks_common as common                             # noqa: E402
 import rmt_cluster as rc                                    # noqa: E402
 from stock_evaluator import (position_guidance, score_candidate,      # noqa: E402
                              RATING_BANDS,                            # v5.5 scale
@@ -76,7 +77,7 @@ from stock_evaluator import (position_guidance, score_candidate,      # noqa: E4
 # CONFIG
 # -------------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 HOLDINGS_PATH = DATA_DIR / "holdings.json"
 SCORED_PATH = DATA_DIR / "scored_candidates.json"
 CLUSTERED_PATH = DATA_DIR / "clustered.json"
@@ -143,23 +144,26 @@ HOLDINGS_TEMPLATE = {
         "ticker: the Yahoo symbol (RY.TO for a TSX listing). "
         "shares: number of shares held. "
         "cost_basis: your average price per share, in the listing's own currency. "
+        "currency: optional - the currency cost_basis is in (USD, CAD). Leave it "
+        "out and it is inferred from the scan, or from a .TO/.V/.CN/.NE suffix; "
+        "set it when you want to be certain, since cost-basis totals are grouped "
+        "by currency and never summed across them. "
         "Delete the example entry below - entries marked _example are ignored."
     ),
     "holdings": [
-        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00, "_example": True}
+        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00,
+         "currency": "USD", "_example": True}
     ],
 }
 
 # "Core: 3%–5%; up to 8% with diversification." -> (3.0, 5.0)
 _PCT_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*[–—-]\s*(\d+(?:\.\d+)?)\s*%")
 
+# Every percentage in a guide string, ranges and standalone caps alike.
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+
+_num = common.num
 
 
 # -------------------------------------------------------------------------
@@ -201,10 +205,16 @@ def load_holdings(holdings_path=None, quiet=False):
         ticker = str(entry.get("ticker") or "").strip().upper()
         if not ticker or ticker == "...":
             continue
+        # An explicit currency is optional and, when present, authoritative:
+        # holdings.json is hand-written, so the person entering a cost basis
+        # knows what currency they paid in better than any inference does.
+        currency = entry.get("currency")
+        currency = str(currency).strip().upper() if isinstance(currency, str) and currency.strip() else None
         holdings.append({
             "ticker": ticker,
             "shares": _num(entry.get("shares")),
             "cost_basis": _num(entry.get("cost_basis")),
+            "currency": currency,
         })
     return holdings, created
 
@@ -322,15 +332,32 @@ def correlation_to_holdings(candidates, holding_tickers, lookback_years=None,
     meta["holdings_in_matrix"] = held_in_matrix
     meta["holdings_missing"] = [t for t in holding_tickers if t not in usable]
 
+    # A pair is only written when BOTH bases are finite numbers. A NaN reaching
+    # disk is worse than a missing pair: downstream it compares False against
+    # every threshold, so it survives the "is this correlated enough to cut"
+    # test and then drives a full-size reduction on a number nobody computed.
     correlations = {}
+    unusable = 0
     for candidate in candidates:
         if candidate not in usable:
             continue
-        correlations[candidate] = {
-            holding: {"cleaned": round(float(cleaned.loc[candidate, holding]), 4),
-                      "raw": round(float(raw.loc[candidate, holding]), 4)}
-            for holding in held_in_matrix if holding != candidate
-        }
+        pairs = {}
+        for holding in held_in_matrix:
+            if holding == candidate:
+                continue
+            clean_value = _num(cleaned.loc[candidate, holding])
+            raw_value = _num(raw.loc[candidate, holding])
+            if clean_value is None or raw_value is None:
+                unusable += 1
+                continue
+            pairs[holding] = {"cleaned": round(clean_value, 4),
+                              "raw": round(raw_value, 4)}
+        correlations[candidate] = pairs
+    if unusable:
+        meta["unusable_pairs"] = unusable
+        if not quiet:
+            print(f"  {unusable} candidate/holding pair(s) had no finite correlation "
+                  f"and were left out rather than written as NaN")
     return correlations, meta
 
 
@@ -407,12 +434,59 @@ def parse_guide_range(guide):
 
 
 def apply_reduction(guide, scale):
-    """Rewrite the guide string with the reduced range, keeping its wording."""
+    """Rewrite the guide string with every percentage in it scaled.
+
+    A guide is not only its range. "Core: 3%-5%; up to 8% with diversification."
+    carries a range AND a cap, and scaling only the first left the two halves
+    of one sentence disagreeing: a halved candidate read "Core: 1.5%-2.5%; up
+    to 8% with diversification", which quotes an 8% ceiling on a position the
+    correlation modifier had just cut to 2.5%.
+
+    Every percentage is scaled instead, and the separator is left exactly as
+    written rather than normalized, so the sentence comes back in its own
+    wording. "Avoid; research only." has no percentage and is returned as-is.
+    """
+    if not guide:
+        return guide
+
     def _sub(match):
-        low = float(match.group(1)) * scale
-        high = float(match.group(2)) * scale
-        return f"{low:.1f}%–{high:.1f}%"
-    return _PCT_RANGE_RE.sub(_sub, guide, count=1)
+        return f"{float(match.group(1)) * scale:.1f}%"
+
+    return _PCT_RE.sub(_sub, guide)
+
+
+def worst_correlation(pairs, basis):
+    """The holding a candidate is most correlated with, on the chosen basis.
+
+    Returns (holding, correlation), or (None, None) when nothing usable is
+    stored. Two things this has to get right, because the naive
+    max(pairs, key=lambda h: pairs[h].get(basis, 0.0)) got both wrong:
+
+      - A stored None. The default in .get() never fires (the key IS there,
+        its value is None), so max() happily returned that holding and the
+        caller compared None <= threshold, which is a TypeError that took the
+        whole sizing stage down.
+      - A stored NaN. Every comparison against NaN is False, so it slipped
+        past the threshold test and was handed to sizing_scale(), which cut
+        the position by the full reduction factor and wrote the reason out as
+        "correlation nan with holding X above 0.70".
+
+    Both are cases of "we do not know", and not knowing is not evidence that a
+    candidate duplicates a holding, so neither may drive a cut. Largest signed
+    correlation wins, not largest magnitude: a strongly negative correlation is
+    not a duplicate position.
+    """
+    usable = {}
+    for holding, values in (pairs or {}).items():
+        if not isinstance(values, dict):
+            continue
+        value = _num(values.get(basis))
+        if value is not None:
+            usable[holding] = value
+    if not usable:
+        return None, None
+    holding = max(usable, key=lambda h: usable[h])
+    return holding, usable[holding]
 
 
 def sizing_scale(correlation, threshold, reduction_factor, flat=False):
@@ -504,11 +578,15 @@ def size_candidate(ticker, record, cluster, holding, correlations,
         sizing["note"] = "no correlation to holdings available for this name"
         return finalize()
 
-    worst = max(pairs, key=lambda h: pairs[h].get(basis, 0.0))
-    worst_corr = pairs[worst].get(basis)
+    worst, worst_corr = worst_correlation(pairs, basis)
+    if worst is None:
+        sizing["note"] = (f"no usable {basis} correlation stored for this name "
+                          f"({len(pairs)} holding(s) compared, all missing or NaN)")
+        return finalize()
+
     sizing["max_correlation"] = worst_corr
-    sizing["max_correlation_raw"] = pairs[worst].get("raw")
-    sizing["max_correlation_cleaned"] = pairs[worst].get("cleaned")
+    sizing["max_correlation_raw"] = _num(pairs[worst].get("raw"))
+    sizing["max_correlation_cleaned"] = _num(pairs[worst].get("cleaned"))
 
     if worst_corr <= threshold:
         sizing["note"] = (f"no meaningful correlation to holdings (max {worst_corr:.2f} "
@@ -542,14 +620,7 @@ def latest_archive_scores(data_dir=None):
         return {}, None
     runs = sorted((d for d in archive.iterdir() if d.is_dir()), reverse=True)
     for run in runs:
-        document = None
-        path = run / "sized_candidates.json"
-        if path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    document = json.load(f)
-            except Exception:
-                document = None
+        document = common.read_json(run / "sized_candidates.json")
         if not document:
             continue
         scores = {}
@@ -615,18 +686,30 @@ def review_holdings(holdings, scored_records=None, previous=None,
                 verdict = "watch"
                 reasons.append(f"composite {composite:.2f} under {EXIT_WATCH_COMPOSITE:.1f}")
             else:
-                # roa_trend_consistent alone is far too sensitive to use here:
-                # it demands a non-decreasing ROA in every single year, so one
-                # down year in four makes it False and it reads as "watch" on
-                # names scoring 9+. Real deterioration is rising debt AND weak
-                # cash generation together.
+                # Two of the three independent trend categories have to be
+                # deteriorating before a scoring holding is worth a second look.
+                #
+                # This used to test rising debt AND weak cash generation only,
+                # as a deliberate workaround: the profitability signal available
+                # at the time was roa_trend_consistent, which demands a
+                # non-decreasing ROA in every single year and so read False on
+                # names scoring 9+ after one soft year. stock_evaluator now
+                # reports roa_trend, which grades the direction instead of
+                # requiring perfection, so profitability can take its place as a
+                # real third category - the same three divergence_pattern counts.
                 years = (record.get("trend_detail") or {}).get("fcf_years_available") or 0
                 positive = record.get("fcf_positive_years")
                 weak_fcf = isinstance(positive, int) and years and positive * 2 <= years
-                if record.get("debt_trend") == "increasing" and weak_fcf:
+                deteriorating = []
+                if record.get("roa_trend") == "deteriorating":
+                    deteriorating.append("ROA declining across the window")
+                if record.get("debt_trend") == "increasing":
+                    deteriorating.append("debt rising over the window")
+                if weak_fcf:
+                    deteriorating.append(f"FCF positive in only {positive} of {years} years")
+                if len(deteriorating) >= 2:
                     verdict = "watch"
-                    reasons.append(f"debt rising over the window and FCF positive in only "
-                                   f"{positive} of {years} years")
+                    reasons.append(" and ".join(deteriorating))
         if not reasons:
             reasons.append("fundamentals still support the position")
 
@@ -642,7 +725,9 @@ def review_holdings(holdings, scored_records=None, previous=None,
             "reasons": reasons,
             "divergence_pattern": record.get("divergence_pattern"),
             "roa_trend_consistent": record.get("roa_trend_consistent"),
+            "roa_trend": record.get("roa_trend"),
             "debt_trend": record.get("debt_trend"),
+            "data_coverage": record.get("data_coverage"),
             "warnings": record.get("warnings") or [],
         })
         if not quiet:
@@ -659,20 +744,7 @@ def review_holdings(holdings, scored_records=None, previous=None,
 # -------------------------------------------------------------------------
 
 def write_json(document, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False, default=str)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path, default=str)
 
 
 def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
@@ -752,8 +824,10 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
             "liquidity_flag": record.get("liquidity_flag"),
             "trend_years_available": record.get("trend_years_available"),
             "roa_trend_consistent": record.get("roa_trend_consistent"),
+            "roa_trend": record.get("roa_trend"),
             "fcf_positive_years": record.get("fcf_positive_years"),
             "debt_trend": record.get("debt_trend"),
+            "data_coverage": record.get("data_coverage"),
             "financials_as_of": record.get("financials_as_of"),
             "price_as_of": record.get("price_as_of"),
             "warnings": record.get("warnings") or [],
@@ -761,6 +835,10 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
         if not slim:
             entry["metrics"] = record.get("metrics")
             entry["frameworks"] = record.get("frameworks")
+            # Small, and the only place the FX-converted dollar volume and the
+            # rate it was converted at survive - the Overview's liquidity
+            # column is a bare tick without it.
+            entry["liquidity"] = record.get("liquidity")
             entry["value_screen"] = record.get("value_screen")
             entry["insider"] = record.get("insider")
         out_candidates.append(entry)
@@ -819,10 +897,12 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
               f"·  correlation-reduced {len(cut)}")
         for c in sorted(cut, key=lambda c: -(c["sizing"]["max_correlation"] or 0))[:12]:
             s = c["sizing"]
+            def _corr(value):
+                return "n/a" if value is None else f"{value:.2f}"
             print(f"    {c['ticker']:<8} {s['base_guide'].split(';')[0]:<28} -> "
                   f"{s['adjusted_guide'].split(';')[0]:<28} "
-                  f"(corr {s['max_correlation_raw']:.2f} raw / "
-                  f"{s['max_correlation_cleaned']:.2f} cleaned with {s['correlated_with']})")
+                  f"(corr {_corr(s['max_correlation_raw'])} raw / "
+                  f"{_corr(s['max_correlation_cleaned'])} cleaned with {s['correlated_with']})")
         for c in held:
             print(f"    {c['ticker']:<8} already held "
                   f"({c['holding'].get('shares')} sh @ {c['holding'].get('cost_basis')})")

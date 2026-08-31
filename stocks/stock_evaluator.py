@@ -58,6 +58,66 @@ v5.5 changes vs v5.4 (these DO change the scoring math — see RECALIBRATION):
   contradiction where the composite rewarded the same 52-week position that
   position_guidance() simultaneously flagged as a risk.
 
+  Note where this meets v5.4.2's data_coverage(): that function was written
+  against score()'s neutral-5.0 default and explicitly did not touch the
+  composite, because it could not without disturbing the calibration. v5.5
+  makes coverage structural instead - missing inputs drop out of their
+  dimension rather than scoring 5.0 - so the two now do different jobs.
+  data_coverage() stays as the per-INPUT availability count the dashboard
+  reads and the thin-data risk flag fires on; build_scores()["coverage"] is
+  the WEIGHT-based figure that gates whether a composite is emitted at all.
+
+v5.4.3 — structure and cost, no change to any score:
+- Paths, the atomic JSON write, number coercion and the JSON encoder come from
+  stocks_common.py instead of being copied into every stage.
+- Batch mode no longer fetches a year of daily OHLCV per ticker. calc_metrics
+  used it for one thing — filling in the 52-week range when info lacks it —
+  and info almost always carries it, so that was a request and a cache file
+  per name for a fallback that hardly ever fires. It is fetched only when the
+  fallback is actually needed.
+- --workers scores several tickers at once. It defaults to 1 on purpose: Yahoo
+  rate-limits an unauthenticated client and backoff sleeps can make a parallel
+  run slower than a serial one. Results are collected in input order, so the
+  output file does not change shape with the setting.
+
+v5.4.2 — the analysis-logic pass. These change which names surface, not just
+which numbers are printed, so a scan from before is not comparable with one
+after:
+- trend_analysis() adds roa_trend, a GRADED direction (improving / flat /
+  deteriorating / mixed) from the share of year-over-year steps that improved
+  plus the overall change. roa_trend_consistent is kept and still reported, but
+  nothing judges on it any more: demanding a non-decreasing ROA in every year
+  means it fires more readily the more history a company has, so the same
+  business read worse for having reported longer.
+- divergence_pattern() counts CATEGORIES, not signals. Revenue-declining and
+  net-income-declining were two of five votes and the trap threshold was two,
+  so one soft year — revenue down, profit down with it — labelled a company a
+  value trap on its own and cost it 35–50% of its position size through the
+  conviction modifier. They are now one "latest year" category alongside
+  profitability, cash generation and balance sheet.
+- data_coverage() records what share of the scoring inputs a ticker actually
+  had. score() returns a neutral 5.0 for anything missing, so a name with
+  almost no data landed near 5.0 and read as a considered HOLD. It does not
+  touch the composite; below LOW_COVERAGE it raises a "thin data" risk flag,
+  which is how this codebase reduces size without disturbing the calibration.
+- liquidity_check() takes an fx_rate and converts a stock's dollar volume into
+  the account's currency before comparing. A TSX name's CAD volume measured
+  against a USD account overstated its liquidity by the whole exchange rate.
+  Without a rate it falls back to the old unconverted comparison and says so.
+- dcf_scenarios() abstains on negative free cash flow instead of returning a
+  large negative intrinsic value that build_scores read as "very expensive".
+  A cash burn is not an overpriced company, and it is already scored through
+  cash runway, FCF quality, growth and Piotroski.
+
+v5.4.1 fixes (the first one DOES move composites — see below):
+- PEG is read again. yfinance dropped `pegRatio` from .info in favour of
+  `trailingPegRatio`, so m["peg"] had been None for every ticker: the report's
+  PEG row was permanently N/A and build_scores() always took the peg-excluded
+  weighting. Both key names are now read and m["peg_source"] records which one
+  answered. Composites shift slightly for any name Yahoo has a trailing PEG
+  for — that is the metric doing what it was always meant to do, but a scan
+  from before this change is not directly comparable with one after it.
+
 v5.4 changes vs v5.3 (all additive — the scoring math is untouched):
 - Adds batch mode: evaluate_universe() scores the candidate universe that
   universe_screen.py writes, and writes data/scored_candidates.json plus a
@@ -458,7 +518,18 @@ def calc_metrics(d):
     # Valuation
     m["pe"] = info.get("trailingPE")
     m["fwd_pe"] = info.get("forwardPE")
-    m["peg"] = info.get("pegRatio")
+    # PEG: yfinance dropped `pegRatio` from .info and now exposes the trailing
+    # figure as `trailingPegRatio`. Reading only the old key meant PEG was
+    # silently None for every ticker, so the valuation blend always took the
+    # peg-excluded branch and the report's PEG row was permanently N/A. Both
+    # keys are read, newest name last, and which one answered is recorded so a
+    # future rename is visible instead of quietly zeroing the metric again.
+    m["peg"], m["peg_source"] = None, None
+    for key in ("pegRatio", "trailingPegRatio"):
+        value = num(info.get(key))
+        if value is not None:
+            m["peg"], m["peg_source"] = value, key
+            break
     m["ps"] = info.get("priceToSalesTrailing12Months")
     m["pb"] = info.get("priceToBook")
     m["ev_ebitda"] = info.get("enterpriseToEbitda")
@@ -864,11 +935,32 @@ def dcf_scenarios(d, m):
     comes from the perpetuity rather than from the explicit forecast. A base
     case above TERMINAL_SHARE_FLAG is resting on an assumption the statements
     cannot support, and build_scores() withholds credit for it.
+
+    Abstains when free cash flow is negative. Growing a negative number for
+    five years and discounting it produces a negative intrinsic value and an
+    upside near -100%, which build_scores then read as "extremely expensive"
+    and folded into the frameworks average as a 1.0. That is a category error:
+    a cash-burning company is not the same thing as an overpriced one, and the
+    burn is already accounted for elsewhere - by the cash-runway warning, by
+    the FCF-quality and growth scores, and by Piotroski's FCF > 0 test. Scoring
+    it here as well charged the same fact twice, against the one metric that
+    could not measure it.
+
+    Returns {"not_applicable": True, "reason": ...}, which carries no "base"
+    or "fade" key and so drops out of the frameworks average rather than
+    dragging it.
     """
     fcf0 = m.get("fcf_normalized") or m.get("fcf_latest")
     shares = m.get("shares")
     price = m.get("price")
     if not fcf0 or not shares: return None
+    if fcf0 < 0:
+        return {"not_applicable": True,
+                "fcf_used": fcf0,
+                "reason": ("free cash flow is negative; a discounted cash flow "
+                           "of a cash burn is not a valuation. The burn is "
+                           "scored through cash runway, FCF quality and growth "
+                           "instead.")}
 
     rules = mrules(m)
     cyc = rules["cyc"]
@@ -1230,6 +1322,106 @@ def build_scores(m, pio, alt, gra, mag, dc, trend=None):
 # recalibration alone would quietly downgrade every holding.
 RATING_BANDS = (7.75, 6.25, 5.00, 3.75)
 
+# The inputs each dimension's score is actually built from, matching
+# build_scores() line for line. Frameworks are counted separately below,
+# because their availability is a framework returning something at all.
+COVERAGE_INPUTS = {
+    "Valuation":     ("pe", "fwd_pe", "ev_ebitda", "ps", "pb"),
+    "Profitability": ("gross_margin", "op_margin", "roe", "roa", "roic"),
+    "Growth":        ("rev_growth", "eps_growth", "fcf_growth"),
+    "Health":        ("debt_eq", "curr_ratio", "quick_ratio", "int_coverage",
+                      "fcf_quality"),
+    "Momentum":      ("pos_52w",),
+}
+
+# Below this share of inputs, a composite is mostly score()'s neutral default
+# rather than a reading of the company.
+LOW_COVERAGE = 0.60
+
+
+def data_coverage(m, pio=None, alt=None, gra=None, mag=None, dc=None):
+    """What share of the scoring inputs this ticker actually had.
+
+    score() returns a neutral 5.0 for anything it cannot read. That is the right
+    default - it refuses to reward or punish a company for Yahoo's coverage of
+    it - but it has a consequence nothing was recording: a ticker with almost no
+    data lands near 5.0 and reads as a considered HOLD / WATCHLIST rather than
+    as an absence of information. A 5.4 built from four inputs and a 5.4 built
+    from twenty-four are not the same claim, and until now the file could not
+    tell them apart.
+
+    Informational only - it does not alter the composite, the same discipline
+    insider conviction, cash runway and the value screen follow. It does earn a
+    risk flag in position_guidance(), which is how this codebase says "size this
+    smaller" without disturbing the scoring calibration.
+
+    v5.5 note: the paragraph above was written when score() returned a neutral
+    5.0 for a missing input. It no longer does - build_scores() drops missing
+    inputs and renormalizes - so this function is no longer the only thing
+    standing between thin data and a confident-looking score. It is kept
+    because it measures something the composite's own coverage figure does
+    not: the share of raw INPUTS present, per dimension, which is what the
+    dashboard's Data column and drill-down read. build_scores()["coverage"] is
+    weighted by how much each dimension matters and decides suppression; this
+    is an unweighted input count and decides a risk flag. Directionally they
+    agree; they are not the same number and are not interchangeable.
+
+    Writes m["data_coverage"] and m["coverage_detail"], and returns the detail.
+    """
+    by_dimension, available, total = {}, 0, 0
+
+    # Metrics a sector makes meaningless are not missing data - build_scores()
+    # excludes them from the score, so counting them here would report a bank
+    # as thin-data for not having a quick ratio.
+    na = NA_METRICS.get(m.get("sector"), ())
+
+    for dimension, keys in COVERAGE_INPUTS.items():
+        keys = tuple(k for k in keys if k not in na)
+        if not keys:
+            by_dimension[dimension] = {"available": 0, "total": 0, "share": None,
+                                       "not_applicable": True}
+            continue
+        got = sum(1 for key in keys if num(m.get(key)) is not None)
+        # PEG only counts where it actually participates: build_scores drops it
+        # and renormalizes when it is missing or flagged unreliable.
+        if dimension == "Valuation" and m.get("peg") is not None and not m.get("peg_excluded"):
+            got, keys = got + 1, keys + ("peg",)
+        by_dimension[dimension] = {"available": got, "total": len(keys),
+                                   "share": round(got / len(keys), 4)}
+        available += got
+        total += len(keys)
+
+    # Frameworks: the same five build_scores() averages over.
+    frameworks = {
+        "piotroski": bool(pio),
+        "altman_z": bool(alt),
+        "graham": bool(gra and gra.get("mos") is not None),
+        "magic_formula": bool(mag),
+        # build_scores anchors the DCF leg on `fade`, falling back to `base`.
+        "dcf": bool(dc and (dc.get("fade") or dc.get("base"))
+                    and (dc.get("fade") or dc.get("base")).get("upside") is not None),
+    }
+    got = sum(1 for present in frameworks.values() if present)
+    by_dimension["Frameworks"] = {"available": got, "total": len(frameworks),
+                                  "share": round(got / len(frameworks), 4),
+                                  "which": frameworks}
+    available += got
+    total += len(frameworks)
+
+    overall = round(available / total, 4) if total else 0.0
+    detail = {"overall": overall, "available": available, "total": total,
+              "low_threshold": LOW_COVERAGE, "by_dimension": by_dimension}
+
+    m["data_coverage"] = overall
+    m["coverage_detail"] = detail
+    if overall < LOW_COVERAGE:
+        m.setdefault("warnings", []).append(
+            f"Thin data: {available} of {total} applicable scoring inputs were "
+            f"available ({overall*100:.0f}%). Missing inputs are dropped rather "
+            f"than scored, so the dimensions here rest on fewer readings than usual.")
+    return detail
+
+
 def rate(comp, dims, m=None):
     if comp is None:
         return "UNMEASURED"
@@ -1272,8 +1464,15 @@ def position_guidance(m, sc, ins, conc=None):
         flags.append("margin compression")
     if conc and conc.get("flags"):
         flags.extend(conc["flags"])
-    if sc.get("coverage") is not None and sc["coverage"] < 0.75:
-        flags.append(f"thin data coverage ({sc['coverage']*100:.0f}%)")
+    # Thin data still earns a flag even though v5.5 no longer lets missing
+    # inputs score a neutral 5.0. Dropping them keeps the score honest about
+    # what it measured; it does not make a three-input dimension as good a
+    # basis for a position as a five-input one. Sized off data_coverage()'s
+    # input count rather than build_scores()' weighted figure, which already
+    # decides suppression - one flag, from the measure meant for it.
+    coverage = num(m.get("data_coverage"))
+    if coverage is not None and coverage < LOW_COVERAGE:
+        flags.append(f"thin data ({coverage*100:.0f}% of inputs)")
 
     if comp is None:
         return {"guide": "Unmeasured; too little data to size a position.",
@@ -1372,7 +1571,9 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs,
         print(f"  Graham      ${gra['graham']}  {arrow}  {gra['mos']}% MoS  (px ${gra['price']})")
     if mag:
         print(f"  Magic Formula  EY {mag['ey']}%  ·  ROIC {mag['roic']}%  ·  Combined {mag['combined']}%")
-    if dc:
+    if dc and dc.get("not_applicable"):
+        print(f"  DCF Scenarios:  not applicable - {dc.get('reason')}")
+    elif dc:
         print("  DCF Scenarios:")
         for name in ("bear", "base", "fade", "bull", "cliff"):
             sc_ = dc.get(name)
@@ -1424,8 +1625,13 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs,
         line("Net margin",       m.get("net_margin_series") or [], pct=True)
         line("ROA",              det.get("roa_by_year") or [], pct=True)
         line("Free cash flow",   det.get("fcf_by_year") or [], money=True)
-        rc = G if trend.get("roa_trend_consistent") is True else Y
-        print(f"  ROA held up across every year: {rc}{trend.get('roa_trend_consistent')}{X}")
+        # Lead with the graded direction v5.4.2 added; the strict every-year
+        # flag is kept beside it but nothing judges on it, since it fires more
+        # readily the more history a company has.
+        rt = trend.get("roa_trend")
+        rc = G if rt == "improving" else (R if rt == "deteriorating" else Y)
+        print(f"  ROA trend: {rc}{rt}{X}"
+              f"   (non-decreasing every year: {trend.get('roa_trend_consistent')})")
         print(f"  Debt trend: {trend.get('debt_trend')}  ·  "
               f"FCF-positive years: {trend.get('fcf_positive_years')}")
 
@@ -1586,6 +1792,8 @@ from pathlib import Path
 
 # market_data.py sits next to this script on the working machine
 # (C:\Users\joey\stocks\), and in stocks/ when this repo is checked out.
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
 def _import_market_data():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
@@ -1594,12 +1802,13 @@ def _import_market_data():
                 sys.path.insert(0, str(candidate))
             break
     import market_data
-    return market_data
+    import stocks_common
+    return market_data, stocks_common
 
 try:
-    md = _import_market_data()
+    md, common = _import_market_data()
 except Exception as _md_err:      # single-ticker mode must not care
-    md = None
+    md = common = None
     _MD_IMPORT_ERROR = _md_err
 else:
     _MD_IMPORT_ERROR = None
@@ -1609,19 +1818,36 @@ else:
 DEFAULT_POSITION_PCT = 0.03
 DEFAULT_MAX_ADV_PCT  = 0.01
 
+# Tickers scored at once in batch mode. One by default - see evaluate_universe
+# for why more is a judgement call rather than a free speed-up.
+DEFAULT_WORKERS = 1
+
+# Guards the per-run FX rate cache when several workers share it.
+import threading as _threading
+_FX_LOCK = _threading.Lock()
+
 # "Bottom of the 52-week range" for the divergence check.
 DIVERGENCE_LOW_POS = 0.25
+
+# How much ROA has to move across the whole window before the direction counts
+# as a direction at all. ROA is a ratio, so this is 0.5 percentage points of
+# return on assets - below that the series is flat, not improving or declining.
+ROA_FLAT_BAND = 0.005
 
 INSUFFICIENT = "insufficient history"
 
 
 def data_dir():
-    """<stocks>\\data — the same directory universe_screen.py writes to."""
-    override = os.environ.get("STOCKS_DATA_DIR")
-    if override:
-        return Path(override)
+    """<stocks>\\data — the same directory universe_screen.py writes to.
+
+    Falls back to this file's own folder when market_data could not be
+    imported, so the single-ticker path never depends on the batch layer.
+    """
     base = Path(md.BASE_DIR) if md is not None else Path(__file__).resolve().parent
-    return base / "data"
+    if common is not None:
+        return common.data_dir(base)
+    override = os.environ.get("STOCKS_DATA_DIR")
+    return Path(override) if override else base / "data"
 
 
 def _require_market_data():
@@ -1739,7 +1965,16 @@ def get_data_cached(ticker, include_insider=False, force_refresh=False):
         payload = fetch_insider(ticker, force_refresh=force_refresh)
         insider = _payload_to_frame(payload) if payload else None
 
-    history = _history_frame(md.get_price_history(ticker, period="1y"))
+    # A year of daily OHLCV is one request and a sizeable cache file per
+    # ticker, and calc_metrics uses it for exactly one thing: filling in the
+    # 52-week high/low when info does not carry them. info almost always does,
+    # so the batch was paying that request for every name in the universe to
+    # cover a fallback that hardly ever fires. Fetch it only when the fallback
+    # is actually needed - the condition below is calc_metrics' own.
+    needs_history = not (num(info.get("fiftyTwoWeekHigh"))
+                         and num(info.get("fiftyTwoWeekLow")))
+    history = (_history_frame(md.get_price_history(ticker, period="1y"))
+               if needs_history else None)
 
     return {
         "ticker": ticker.upper(),
@@ -1812,6 +2047,7 @@ def trend_analysis(d):
         return {
             "trend_years_available": years,
             "roa_trend_consistent": INSUFFICIENT,
+            "roa_trend": INSUFFICIENT,
             "fcf_positive_years": INSUFFICIENT,
             "debt_trend": INSUFFICIENT,
             "trend_detail": {"roa_by_year": [], "fcf_by_year": [], "debt_by_year": [],
@@ -1822,10 +2058,43 @@ def trend_analysis(d):
     fcf_valid = [v for v in fcf_series if v is not None]
     debt_valid = [v for v in debt_series if v is not None]
 
+    # Two readings of the same series, and the difference matters.
+    #
+    # roa_trend_consistent is the strict one: non-decreasing in EVERY year. It
+    # is kept because it is a real, precise statement, but it must not be the
+    # one anything judges on, because it is not comparable between names. It
+    # demands more the more history a company has - one down year in four makes
+    # it False, while a two-year-old listing only has to clear a single step -
+    # so the same business looks worse purely for having reported longer.
+    # position_sizer's exit review already says as much in a comment and works
+    # around it; divergence_pattern did not, and voted on it.
+    #
+    # roa_trend is the graded one: which direction the series actually went,
+    # from the share of year-over-year steps that improved and the overall
+    # first-to-last change. One down year inside a rising series reads
+    # "improving", which is what it is.
+    roa_consistent = INSUFFICIENT
+    roa_trend = INSUFFICIENT
+    roa_shape = {}
     if len(roa_valid) >= 2:
         roa_consistent = all(b >= a for a, b in zip(roa_valid, roa_valid[1:]))
-    else:
-        roa_consistent = INSUFFICIENT
+        steps = list(zip(roa_valid, roa_valid[1:]))
+        up = sum(1 for a, b in steps if b > a)
+        down = sum(1 for a, b in steps if b < a)
+        change = roa_valid[-1] - roa_valid[0]
+        roa_shape = {"steps": len(steps), "steps_up": up, "steps_down": down,
+                     "first": round(roa_valid[0], 6), "last": round(roa_valid[-1], 6),
+                     "change": round(change, 6), "flat_band": ROA_FLAT_BAND}
+        if abs(change) < ROA_FLAT_BAND:
+            roa_trend = "flat"
+        elif change > 0 and up >= down:
+            roa_trend = "improving"
+        elif change < 0 and down >= up:
+            roa_trend = "deteriorating"
+        else:
+            # The endpoints and the steps disagree - a spike or a trough is
+            # doing the work. Neither direction is a fair summary.
+            roa_trend = "mixed"
 
     fcf_positive = len([v for v in fcf_valid if v > 0]) if fcf_valid else INSUFFICIENT
 
@@ -1849,6 +2118,7 @@ def trend_analysis(d):
     return {
         "trend_years_available": years,
         "roa_trend_consistent": roa_consistent,
+        "roa_trend": roa_trend,
         "fcf_positive_years": fcf_positive,
         "debt_trend": debt_trend,
         "trend_detail": {
@@ -1857,6 +2127,7 @@ def trend_analysis(d):
             "debt_by_year": _round(debt_series),
             # Per-series counts: a series can be shorter than the window when
             # Yahoo omits a line item, so "N of M" is stated per series.
+            "roa_shape": roa_shape,
             "roa_years_available": len(roa_valid),
             "fcf_years_available": len(fcf_valid),
             "debt_years_available": len(debt_valid),
@@ -1870,14 +2141,24 @@ def liquidity_check(m, account_size=None,
                     position_pct=DEFAULT_POSITION_PCT,
                     max_adv_pct=DEFAULT_MAX_ADV_PCT,
                     account_currency=None,
-                    avg_volume_hint=None):
+                    avg_volume_hint=None,
+                    fx_rate=None):
     """How much of a normal trading day one position would be.
 
     A flag, never an exclusion: thin names stay in the scan and are marked so
     the reason is visible downstream instead of silently disappearing.
 
-    Dollar volume is in the stock's own quote currency. When that differs from
-    the account currency the comparison is not FX-adjusted, and says so.
+    The two sides of this ratio are quoted in different currencies. Dollar
+    volume is price x shares in the STOCK's currency; the position is a share
+    of the ACCOUNT, in the account's currency. Dividing one by the other
+    unconverted is a real error, not a rounding one: a TSX name's volume in CAD
+    measured against a USD account overstated its liquidity by the whole
+    exchange rate, so thin Canadian names read as tradeable in a US account and
+    the flag they should have raised never fired.
+
+    `fx_rate` converts the quote currency into the account currency. When it is
+    not supplied and the two differ, the comparison falls back to the old
+    unconverted one and says so rather than inventing a rate of 1.0.
     """
     result = {"evaluated": False, "account_size": account_size,
               "position_pct": position_pct, "max_adv_pct": max_adv_pct}
@@ -1892,9 +2173,18 @@ def liquidity_check(m, account_size=None,
         result["note"] = "price or average volume unavailable"
         return False, result
 
-    adv_value = price * volume
-    position_value = account_size * position_pct
-    share = sd(position_value, adv_value)
+    quote_currency = m.get("quote_currency")
+    adv_value = price * volume                       # in the quote currency
+    position_value = account_size * position_pct     # in the account currency
+
+    rate = num(fx_rate)
+    same_currency = bool(account_currency and quote_currency
+                         and str(account_currency).upper() == str(quote_currency).upper())
+    if same_currency:
+        rate = 1.0
+    adv_in_account = adv_value if rate is None else adv_value * rate
+
+    share = sd(position_value, adv_in_account)
     if share is None:
         result["note"] = "average daily dollar volume is zero"
         return False, result
@@ -1902,13 +2192,22 @@ def liquidity_check(m, account_size=None,
     result.update({
         "evaluated": True,
         "avg_daily_dollar_volume": round(adv_value, 2),
+        "avg_daily_dollar_volume_account": round(adv_in_account, 2),
         "position_value": round(position_value, 2),
         "position_pct_of_adv": round(share, 6),
-        "quote_currency": m.get("quote_currency"),
+        "quote_currency": quote_currency,
+        "account_currency": account_currency,
+        "fx_rate": rate,
+        "fx_adjusted": bool(rate is not None and not same_currency),
     })
-    if account_currency and m.get("quote_currency") and account_currency != m.get("quote_currency"):
-        result["fx_note"] = (f"dollar volume in {m['quote_currency']}, account in "
-                             f"{account_currency}; not FX-adjusted")
+    if not same_currency and account_currency and quote_currency:
+        if rate is None:
+            result["fx_note"] = (f"dollar volume in {quote_currency}, account in "
+                                 f"{account_currency}; no rate available, so this "
+                                 f"comparison is NOT FX-adjusted")
+        else:
+            result["fx_note"] = (f"dollar volume converted {quote_currency}->"
+                                 f"{account_currency} at {rate:.4f}")
 
     return bool(share > max_adv_pct), result
 
@@ -1937,51 +2236,132 @@ def divergence_pattern(m, trend, low_pos=DIVERGENCE_LOW_POS):
     deterioration = detail["deterioration"]
     holding_up = detail["holding_up"] = []
 
-    if trend.get("roa_trend_consistent") is False:
-        deterioration.append("ROA not holding up across available years")
-    elif trend.get("roa_trend_consistent") is True:
-        holding_up.append("ROA non-decreasing across available years")
+    # Signals are grouped into four INDEPENDENT categories, and the trap
+    # threshold counts categories rather than signals.
+    #
+    # It used to count signals, with revenue-declining and net-income-declining
+    # as two of the five. Those are not two findings, they are one bad year
+    # seen twice - revenue falls and profit falls with it - so a company whose
+    # only problem was a single soft year hit the two-signal threshold on its
+    # own and was labelled a value trap, which then cost it 35-50% of its
+    # position size through the conviction modifier. That is precisely the
+    # fundamentals-intact/price-depressed case the pipeline exists to find.
+    #
+    # Grouped, one soft year is one category and reads neutral; a soft year
+    # ALONGSIDE rising debt, or thin cash generation, still reads as a trap.
+    categories = {
+        "profitability": None,   # multi-year ROA direction
+        "cash_generation": None, # how often FCF was positive
+        "balance_sheet": None,   # where debt went over the window
+        "latest_year": None,     # revenue / net income in the most recent year
+    }
+
+    roa_trend = trend.get("roa_trend")
+    if roa_trend == "deteriorating":
+        categories["profitability"] = False
+        deterioration.append("ROA declining across available years")
+    elif roa_trend in ("improving", "flat"):
+        categories["profitability"] = True
+        holding_up.append(f"ROA {roa_trend} across available years")
 
     if isinstance(trend.get("fcf_positive_years"), int):
         fcf_years = (trend.get("trend_detail") or {}).get("fcf_years_available") or 0
         if fcf_years and trend["fcf_positive_years"] * 2 <= fcf_years:
+            categories["cash_generation"] = False
             deterioration.append(
                 f"FCF positive in only {trend['fcf_positive_years']} of {fcf_years} years")
         elif fcf_years:
+            categories["cash_generation"] = True
             holding_up.append(
                 f"FCF positive in {trend['fcf_positive_years']} of {fcf_years} years")
 
     if trend.get("debt_trend") == "increasing":
+        categories["balance_sheet"] = False
         deterioration.append("debt rising over the full window")
     elif trend.get("debt_trend") in ("decreasing", "flat"):
+        categories["balance_sheet"] = True
         holding_up.append(f"debt {trend['debt_trend']} over the full window")
 
+    # One category for the latest year, however many of its lines moved.
     rev_growth = num(m.get("rev_growth_raw"))
-    if rev_growth is not None:
-        (deterioration if rev_growth < 0 else holding_up).append(
-            f"revenue {'declining' if rev_growth < 0 else 'growing'} year over year")
     ni_growth = num(m.get("ni_growth"))
-    if ni_growth is not None:
-        (deterioration if ni_growth < 0 else holding_up).append(
-            f"net income {'declining' if ni_growth < 0 else 'growing'} year over year")
+    latest = [(label, value) for label, value in
+              (("revenue", rev_growth), ("net income", ni_growth)) if value is not None]
+    if latest:
+        falling = [label for label, value in latest if value < 0]
+        rising = [label for label, value in latest if value >= 0]
+        if falling:
+            categories["latest_year"] = False
+            deterioration.append(f"{' and '.join(falling)} declining year over year")
+            if rising:
+                holding_up.append(f"{' and '.join(rising)} still growing year over year")
+        else:
+            categories["latest_year"] = True
+            holding_up.append(f"{' and '.join(rising)} growing year over year")
 
-    if len(deterioration) >= 2:
+    failing = sorted(k for k, v in categories.items() if v is False)
+    passing = sorted(k for k, v in categories.items() if v is True)
+    detail["categories"] = categories
+    detail["deteriorating_categories"] = failing
+    detail["holding_up_categories"] = passing
+
+    if len(failing) >= 2:
+        detail["reason"] = (f"{len(failing)} independent categories deteriorating "
+                            f"({', '.join(failing)})")
         return "trend_confirms_decline", detail
-    if not deterioration and holding_up:
+    if not failing and passing:
+        detail["reason"] = (f"nothing deteriorating across {len(passing)} category "
+                            f"({', '.join(passing)})" if len(passing) == 1 else
+                            f"nothing deteriorating across {len(passing)} categories "
+                            f"({', '.join(passing)})")
         return "price_disconnect", detail
 
     # No deterioration but nothing holding up either: a recent IPO with no
     # usable history is not evidence that the business is fine.
-    detail["reason"] = ("one deterioration signal only; neither pattern is clear"
-                        if deterioration else
+    detail["reason"] = (f"only {failing[0]} is deteriorating; one category is not "
+                        f"enough to call a trap"
+                        if failing else
                         "no usable trend data to confirm the price move")
     return "neutral", detail
 
 
 # ─── SCORING ONE CANDIDATE ─────────────────────────────────────────────────
+def fx_rate_for(quote_currency, account_currency, cache=None):
+    """Rate converting a stock's quote currency into the account's, memoized.
+
+    Rates are per currency PAIR, not per ticker, so a whole batch of Canadian
+    names costs one lookup - and market_data caches that on disk for the day,
+    so a re-run costs none. `cache` is an ordinary dict the caller keeps for
+    the length of a run.
+    """
+    if not quote_currency or not account_currency:
+        return None
+    quote = str(quote_currency).strip().upper()
+    account = str(account_currency).strip().upper()
+    if not quote or not account:
+        return None
+    if quote == account:
+        return 1.0
+    if md is None:
+        return None
+    key = (quote, account)
+    if cache is None:
+        return md.get_fx_rate(quote, account)
+    # Held across the fetch so several workers hitting a currency for the first
+    # time make one request between them rather than one each. The lock is not
+    # a correctness problem for the rate itself - the fetch is idempotent and
+    # disk-cached - it just stops a batch of Canadian names from opening the
+    # same conversation with Yahoo N times at once.
+    with _FX_LOCK:
+        if key not in cache:
+            cache[key] = md.get_fx_rate(quote, account)
+        return cache[key]
+
+
 def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT,
                     max_adv_pct=DEFAULT_MAX_ADV_PCT, account_currency=None,
-                    avg_volume_hint=None, include_insider=False, force_refresh=False):
+                    avg_volume_hint=None, include_insider=False, force_refresh=False,
+                    fx_cache=None):
     """Run one ticker through the existing pipeline, quietly.
 
     Same calls evaluate() makes, minus print_report(), plus the v5.4 fields.
@@ -2009,13 +2389,17 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
         trend = trend_analysis(data)
         sc = build_scores(m, pio, alt, gra, mag, dc, trend=trend)
         conc = concentration_check(m, dc)
+        # Before position_guidance: it reads m["data_coverage"] for its
+        # thin-data risk flag.
+        coverage = data_coverage(m, pio, alt, gra, mag, dc)
         pos = position_guidance(m, sc, ins, conc)
         vs = value_screen(m, sc["dims"])
 
         liquidity_flag, liquidity = liquidity_check(
             m, account_size=account_size, position_pct=position_pct,
             max_adv_pct=max_adv_pct, account_currency=account_currency,
-            avg_volume_hint=avg_volume_hint)
+            avg_volume_hint=avg_volume_hint,
+            fx_rate=fx_rate_for(m.get("quote_currency"), account_currency, fx_cache))
         pattern, divergence = divergence_pattern(m, trend)
 
         if liquidity_flag:
@@ -2050,9 +2434,12 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
             "position_guidance": pos,
             "value_screen": vs,
             "insider": ins,
+            "data_coverage": coverage["overall"],
+            "coverage_detail": coverage,
             # v5.4 additions
             "trend_years_available": trend["trend_years_available"],
             "roa_trend_consistent": trend["roa_trend_consistent"],
+            "roa_trend": trend["roa_trend"],
             "fcf_positive_years": trend["fcf_positive_years"],
             "debt_trend": trend["debt_trend"],
             "trend_detail": trend["trend_detail"],
@@ -2080,40 +2467,20 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
 
 # ─── BATCH RUN ─────────────────────────────────────────────────────────────
 def _json_default(o):
-    if isinstance(o, datetime):
-        return o.isoformat()
-    item = getattr(o, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except Exception:
-            pass
-    return str(o)
+    """stocks_common's encoder; batch mode always has it, since it needs md."""
+    return common.json_default(o)
 
 
 def _write_json(document, output_path):
     """Atomic write, so a reader never sees a half-written scan."""
-    import tempfile
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False, default=_json_default)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path, default=common.json_default)
 
 
 def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                       position_pct=DEFAULT_POSITION_PCT, max_adv_pct=DEFAULT_MAX_ADV_PCT,
                       account_currency="USD", limit=None, sectors=None,
-                      include_insider=False, force_refresh=False, quiet=False):
+                      include_insider=False, force_refresh=False, quiet=False,
+                      workers=DEFAULT_WORKERS):
     """Score every candidate from Stage 0 into data\\scored_candidates.json.
 
     Reads the candidates.json universe_screen.py writes, runs each ticker
@@ -2121,6 +2488,18 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
     writes every successful record plus a "skipped" list of the tickers that
     failed and why. A ticker that cannot be fetched or scored is logged and
     stepped over - the batch always finishes.
+
+    `workers` runs several tickers at once. It defaults to 1, and that default
+    is a judgement, not laziness: market_data exists so "Yahoo sees one
+    well-behaved client", and an unauthenticated client that opens eight
+    parallel conversations with Yahoo gets rate-limited, at which point
+    fetch_with_backoff starts sleeping and the run can finish slower than it
+    would have serially. 2-4 is a reasonable place to experiment; the disk
+    cache already makes the second run of a day nearly free, which is the
+    cheaper way to get the same time back.
+
+    Results are collected in input order however many workers are used, so the
+    output file does not change shape with the setting.
     """
     _require_market_data()
 
@@ -2140,6 +2519,7 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
     scored, skipped = [], []
     total = len(candidates)
     started = datetime.now()
+    fx_cache = {}          # one entry per currency pair for the whole batch
 
     if not quiet:
         print(f"\n  {B}{C}Batch scoring {total} candidate(s){X}")
@@ -2150,34 +2530,59 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                   f"{max_adv_pct*100:.0f}% of average daily dollar volume")
         print()
 
-    for i, candidate in enumerate(candidates, 1):
+    def _score(candidate):
+        """One candidate -> (ticker, record, reason). Never raises."""
         ticker = str(candidate.get("ticker") or "").strip().upper()
         if not ticker:
-            skipped.append({"ticker": None, "reason": "candidate row has no ticker"})
-            continue
-
+            return None, None, "candidate row has no ticker"
         record, reason = score_candidate(
             ticker,
             account_size=account_size, position_pct=position_pct,
             max_adv_pct=max_adv_pct, account_currency=account_currency,
             avg_volume_hint=candidate.get("avg_volume"),
-            include_insider=include_insider, force_refresh=force_refresh)
+            include_insider=include_insider, force_refresh=force_refresh,
+            fx_cache=fx_cache)
+        return ticker, record, reason
 
-        if record is None:
-            skipped.append({"ticker": ticker, "reason": reason})
-            if not quiet:
-                print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
-            continue
-
-        scored.append(record)
+    workers = max(1, int(workers or 1))
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=workers)
+        # .map yields in submission order, so a run with workers=8 writes the
+        # same file in the same order as a run with workers=1.
+        results = pool.map(_score, candidates)
         if not quiet:
-            flags = []
-            if record["liquidity_flag"]:
-                flags.append("thin")
-            if record["divergence_pattern"] != "neutral":
-                flags.append(record["divergence_pattern"])
-            suffix = f"  [{', '.join(flags)}]" if flags else ""
-            print(f"  [{i:>4}/{total}] {ticker:<10} {colour(record['composite'])} / 10{suffix}")
+            print(f"  {workers} workers (market_data gives each its own session)\n")
+    else:
+        pool = None
+        results = (_score(candidate) for candidate in candidates)
+
+    try:
+        for i, (ticker, record, reason) in enumerate(results, 1):
+            if ticker is None:
+                skipped.append({"ticker": None, "reason": reason})
+                continue
+
+            if record is None:
+                skipped.append({"ticker": ticker, "reason": reason})
+                if not quiet:
+                    print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
+                continue
+
+            scored.append(record)
+            if not quiet:
+                flags = []
+                if record["liquidity_flag"]:
+                    flags.append("thin")
+                if record["divergence_pattern"] != "neutral":
+                    flags.append(record["divergence_pattern"])
+                suffix = f"  [{', '.join(flags)}]" if flags else ""
+                print(f"  [{i:>4}/{total}] {ticker:<10} "
+                      f"{colour(record['composite'])} / 10{suffix}")
+    finally:
+        if pool is not None:
+            # Ctrl-C mid-batch should not leave worker threads running.
+            pool.shutdown(wait=True)
 
     document = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2191,8 +2596,15 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             "sectors": sorted(sectors) if sectors else None,
             "limit": limit,
             "include_insider": include_insider,
+            "workers": workers,
+            # Which rates the liquidity gate actually converted at, so a run is
+            # reproducible and an un-convertible currency is visible as a null
+            # rather than as a silently unconverted comparison.
+            "fx_rates": {f"{quote}->{account}": rate
+                         for (quote, account), rate in sorted(fx_cache.items())},
             "evaluator_version": "5.5",
             "min_coverage": MIN_COVERAGE,
+            "low_coverage": LOW_COVERAGE,
         },
         "counts": {"candidates": total, "scored": len(scored), "skipped": len(skipped)},
         "scored": scored,
@@ -2253,6 +2665,11 @@ def batch_main(argv):
     parser.add_argument("--limit", type=int, help="score only the first N candidates")
     parser.add_argument("--insider", action="store_true",
                         help="also pull insider transactions (one extra request per ticker)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
+                        help=f"score N tickers at once (default {DEFAULT_WORKERS}). "
+                             f"Yahoo rate-limits an unauthenticated client, and "
+                             f"backoff sleeps can make a parallel run slower than a "
+                             f"serial one - raise this deliberately, 2-4 first")
     parser.add_argument("--refresh", action="store_true", help="ignore cached data and refetch")
     parser.add_argument("--quiet", action="store_true", help="only print the summary")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2272,7 +2689,7 @@ def batch_main(argv):
                           max_adv_pct=args.max_adv_pct, account_currency=args.account_currency,
                           limit=args.limit, sectors=args.sectors,
                           include_insider=args.insider, force_refresh=args.refresh,
-                          quiet=args.quiet)
+                          quiet=args.quiet, workers=args.workers)
     except FileNotFoundError as e:
         print(f"\n  {R}Candidate universe not found: {e}{X}")
         print("  Run universe_screen.py first to build data/candidates.json.\n")
@@ -2297,6 +2714,7 @@ def evaluate(ticker):
     trend = trend_analysis(data)
     sc  = build_scores(m, pio, alt, gra, mag, dc, trend=trend)
     conc = concentration_check(m, dc)
+    data_coverage(m, pio, alt, gra, mag, dc)
     pos = position_guidance(m, sc, ins, conc)
     vs  = value_screen(m, sc["dims"])
     print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs,

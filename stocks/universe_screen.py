@@ -24,8 +24,12 @@ How the pull is shaped:
 
 Output: <stocks>\data\candidates.json (see write_candidates for the schema).
 An empty result set is written like any other - no matches is a legitimate
-market state. Every partition failing is not, and leaves the previous file
-alone (see total_failure).
+market state. Partitions failing is not: when every partition fails
+(total_failure), or when more than --max-failure-rate of them do
+(partial_failure), the previous file is kept and the run exits 1. A universe
+built from whichever sectors Yahoo happened to answer for is indistinguishable
+downstream from a genuinely narrower market, which is exactly why it must not
+be written.
 
 Setup:
     pip install yfinance curl_cffi requests
@@ -52,6 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 import market_data as md
+import stocks_common as common     # importable: market_data put this folder on sys.path
 from yfinance import EquityQuery   # query construction only - no network here
 
 
@@ -60,7 +65,7 @@ from yfinance import EquityQuery   # query construction only - no network here
 # -------------------------------------------------------------------------
 
 # Sits next to market_data.py, so C:\Users\joey\stocks\data\candidates.json.
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (md.BASE_DIR / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 OUTPUT_PATH = DATA_DIR / "candidates.json"
 
 # Loose by design. Every one of these is an "obviously not worth analysing"
@@ -115,12 +120,7 @@ def yahoo_sectors() -> list:
         return list(FALLBACK_SECTORS)
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # -------------------------------------------------------------------------
@@ -312,19 +312,46 @@ def to_candidate(symbol: str, quote: dict, sector: Optional[str]) -> dict:
     }
 
 
+# Fraction of partitions that may fail before the run is judged a fetch
+# failure rather than a market state. One dead sector out of eleven is weather;
+# six are an outage, and the universe that comes back from the survivors is not
+# the market, it is whichever sectors Yahoo happened to answer for.
+DEFAULT_MAX_FAILURE_RATE = 0.5
+
+
+def failure_rate(stats: list) -> float:
+    """Share of partitions that failed outright, 0.0-1.0."""
+    if not stats:
+        return 0.0
+    return sum(1 for s in stats if s["failed"]) / len(stats)
+
+
 def total_failure(stats: list, candidates: list) -> bool:
     """True when nothing came back and every partition errored out - i.e. the
     run failed, as opposed to the market simply having no matches."""
     return bool(stats) and not candidates and all(s["failed"] for s in stats)
 
 
+def partial_failure(stats: list, max_failure_rate: float = DEFAULT_MAX_FAILURE_RATE):
+    """True when enough partitions failed that the survivors are not a universe.
+
+    total_failure() only catches the all-or-nothing case, which meant ten of
+    eleven sectors failing wrote a Technology-only file over a good full-market
+    one - and Stage 1 then scored that as if it were the market, with nothing
+    downstream able to tell the difference. A run this incomplete is a fetch
+    failure with some rows attached, not a market with few matches.
+
+    Returns (is_partial, failed_count, total_count).
+    """
+    if not stats:
+        return False, 0, 0
+    failed = sum(1 for s in stats if s["failed"])
+    return failure_rate(stats) > max_failure_rate, failed, len(stats)
+
+
 def previous_run_stamp(output_path: Path) -> Optional[str]:
     """generated_at of the file already on disk, for the abort message."""
-    try:
-        with open(output_path, "r", encoding="utf-8") as f:
-            return json.load(f).get("generated_at")
-    except Exception:
-        return None
+    return (common.read_json(output_path) or {}).get("generated_at")
 
 
 def write_candidates(candidates: list,
@@ -345,20 +372,7 @@ def write_candidates(candidates: list,
         "dropped_duplicates": dropped,
         "candidates": candidates,
     }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path)
 
 
 # -------------------------------------------------------------------------
@@ -389,8 +403,14 @@ def parse_args(argv=None):
     parser.add_argument("--no-dedupe", action="store_true",
                         help="skip dual-class/cross-listing dedupe")
     parser.add_argument("--force-write", action="store_true",
-                        help="write the output file even if every partition failed "
+                        help="write the output file even if the run failed "
                              "(default: keep the previous file and exit 1)")
+    parser.add_argument("--max-failure-rate", type=float,
+                        default=DEFAULT_MAX_FAILURE_RATE, metavar="FRACTION",
+                        help=f"abort rather than overwrite a good universe when more "
+                             f"than this share of partitions failed "
+                             f"(default {DEFAULT_MAX_FAILURE_RATE}; 1.0 only aborts "
+                             f"when every partition failed)")
     parser.add_argument("--refresh", action="store_true",
                         help="ignore cached screen pages and refetch")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH,
@@ -494,6 +514,14 @@ def main(argv=None) -> int:
         "sort_field": "ticker",
         "screen_ttl_seconds": md.TTL_SCREENER,
         "deduped": not args.no_dedupe,
+        # Stated as a headline, not only as rows in `partitions`: a downstream
+        # stage reading this file needs to be able to see at a glance that the
+        # universe it is about to score came back incomplete.
+        "partitions_total": len(stats),
+        "partitions_failed": sum(1 for s in stats if s["failed"]),
+        "partitions_truncated": sum(1 for s in stats if s["truncated"]),
+        "partition_failure_rate": round(failure_rate(stats), 4),
+        "max_failure_rate": args.max_failure_rate,
         "partitions": stats,
     }
 
@@ -506,18 +534,30 @@ def main(argv=None) -> int:
               f"(see query_params.partitions)")
 
     # A market with nothing in it is a real state and gets written like any
-    # other. Every partition failing is not: that is the network, not the
-    # market, and overwriting a good universe with an empty one would break
-    # the pipeline for a reason that has nothing to do with stocks.
-    if total_failure(stats, candidates) and args.output.exists() and not args.force_write:
+    # other. Partitions failing is not: that is the network, not the market,
+    # and overwriting a good universe with what the surviving sectors happened
+    # to return would break the pipeline for a reason that has nothing to do
+    # with stocks - silently, because a smaller universe looks exactly like a
+    # tighter market to every stage downstream.
+    is_partial, failed_count, partition_count = partial_failure(stats, args.max_failure_rate)
+    if (total_failure(stats, candidates) or is_partial) \
+            and args.output.exists() and not args.force_write:
         previous = previous_run_stamp(args.output)
-        print(f"\nABORT: all {len(stats)} partition(s) failed - this is a fetch failure, "
-              f"not an empty market.")
+        if failed_count == partition_count:
+            what = (f"all {partition_count} partition(s) failed - this is a fetch "
+                    f"failure, not an empty market.")
+        else:
+            what = (f"{failed_count} of {partition_count} partition(s) failed "
+                    f"({failure_rate(stats):.0%}, over the "
+                    f"{args.max_failure_rate:.0%} limit) - the {len(candidates)} "
+                    f"name(s) that came back are the sectors Yahoo answered for, "
+                    f"not the market.")
+        print(f"\nABORT: {what}")
         print(f"       kept the existing {args.output}"
               + (f" (generated {previous})" if previous else "")
-              + " instead of emptying it.")
-        print("       rerun when the network is back, or pass --force-write to "
-              "overwrite it with an empty universe.")
+              + " instead of replacing it.")
+        print("       rerun when the network is back, pass --force-write to "
+              "overwrite it anyway, or raise --max-failure-rate.")
         return 1
 
     output_path = write_candidates(candidates, query_params, dropped, args.output)

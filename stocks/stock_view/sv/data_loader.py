@@ -31,6 +31,7 @@ FILENAMES = {
     "clustered": "clustered.json",
     "sized": "sized_candidates.json",
     "holdings": "holdings.json",
+    "run_status": "run_status.json",
 }
 
 # What the scan is expected to have refreshed. Mirrors market_data.TTL_PRICE
@@ -182,6 +183,8 @@ class Scan:
     scored: Loaded
     holdings: Loaded
     sentiment: Loaded
+    universe: Loaded          # candidates.json - Stage 0's own output
+    run_status: Loaded        # what scan_report's last run actually did
     _scored_index: dict = field(default_factory=dict, repr=False)
 
     # ── the primary source ────────────────────────────────────────────────
@@ -249,6 +252,52 @@ class Scan:
                     self._scored_index[key] = record
         return self._scored_index.get((ticker or "").strip().upper())
 
+    # ── Stage 0's own account of itself ──────────────────────────────────
+    @property
+    def universe_health(self) -> dict:
+        """Whether the universe this scan was built on came back whole.
+
+        universe_screen refuses to overwrite a good candidates.json when more
+        than half its region/sector partitions fail, but a run under that bar
+        still writes a thinner universe than usual - and downstream a smaller
+        universe is indistinguishable from a tighter market. It records the
+        counts; this is the only thing that reads them back.
+
+        Returns {} for a candidates.json written before those counts existed,
+        which is not the same as a clean run and is reported as unknown.
+        """
+        params = (self.universe.document or {}).get("query_params") or {}
+        total = params.get("partitions_total")
+        if not total:
+            return {}
+        failed = params.get("partitions_failed") or 0
+        truncated = params.get("partitions_truncated") or 0
+        return {
+            "total": total,
+            "failed": failed,
+            "truncated": truncated,
+            "failure_rate": _num(params.get("partition_failure_rate")) or 0.0,
+            "max_failure_rate": _num(params.get("max_failure_rate")),
+            "candidates": len((self.universe.document or {}).get("candidates") or []),
+            "complete": not failed and not truncated,
+        }
+
+    # ── the last run's own verdict ───────────────────────────────────────
+    @property
+    def last_run(self) -> dict:
+        """scan_report's record of what each stage did, or {}."""
+        return self.run_status.document or {}
+
+    @property
+    def run_halted(self) -> bool:
+        """True when the last recorded run stopped at a required stage.
+
+        The files on disk are then a mix of new and stale, and presenting them
+        as one scan is the thing worth refusing to do quietly.
+        """
+        document = self.run_status.document
+        return bool(document) and document.get("completed") is False
+
     @property
     def any_data(self) -> bool:
         return self.sized.exists or self.clustered.exists or self.scored.exists
@@ -268,6 +317,8 @@ def load_scan(directory: Optional[Path] = None) -> Scan:
         scored=load("scored", directory),
         holdings=load("holdings", directory),
         sentiment=load("sentiment", directory),
+        universe=load("candidates", directory),
+        run_status=load("run_status", directory),
     )
 
 
@@ -291,10 +342,13 @@ def holding_entries(document: Optional[dict]) -> list:
         if not isinstance(entry, dict):
             continue
         ticker = str(entry.get("ticker") or "").strip().upper()
+        currency = entry.get("currency")
         row = {
             "ticker": ticker,
             "shares": _num(entry.get("shares")),
             "cost_basis": _num(entry.get("cost_basis")),
+            "currency": (str(currency).strip().upper()
+                         if isinstance(currency, str) and currency.strip() else None),
         }
         if entry.get("_example"):
             row["ignored_because"] = "marked _example - the untouched template"
@@ -307,13 +361,23 @@ def holding_entries(document: Optional[dict]) -> list:
     return kept, ignored
 
 
-def infer_currency(ticker: str, scan: Optional[Scan] = None) -> Optional[str]:
-    """A holding's quote currency, preferring what the scan already knows.
+def infer_currency(ticker: str, scan: Optional[Scan] = None,
+                   declared: Optional[str] = None) -> Optional[str]:
+    """A holding's quote currency: what it declares, else what the scan knows.
 
-    holdings.json records no currency, so a cost-basis total over mixed
-    listings would silently add CAD to USD. The scan knows quote_currency for
-    every name it scored; the suffix rule only covers what it does not.
+    A cost-basis total over mixed listings would silently add CAD to USD, so
+    this has to be right. In order of authority:
+
+      1. `currency` on the holdings.json entry. It is hand-written, and the
+         person who entered the cost basis knows what they paid in.
+      2. quote_currency from the scan, for any name it scored.
+      3. the .TO/.V/.CN/.NE suffix, which only covers Canadian listings.
+
+    None when none of the three can say, and the caller reports it as unknown
+    rather than guessing.
     """
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip().upper()
     ticker = (ticker or "").strip().upper()
     if scan is not None:
         for candidate in scan.candidates:

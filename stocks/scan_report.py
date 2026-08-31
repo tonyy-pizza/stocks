@@ -14,10 +14,26 @@ Freshness cascades: if a stage does re-run, every stage after it re-runs too,
 because their inputs just changed. A fresh file downstream of a stale one is
 not actually fresh.
 
+Failures cascade too. Each stage's exit code is checked, and a required stage
+that fails - or that returns 0 without actually writing its output, which is
+what universe_screen's abort path looks like from here - stops the run instead
+of letting the next stage read yesterday's file and report it as today's. The
+report is still rendered from what is on disk, with a note saying so, and the
+process exits non-zero. Sentiment is the one optional stage: it fails routinely
+when Reddit rate-limits, is reported, and does not halt anything.
+
 Nothing here re-implements a stage. Each is invoked through its own entry
 point (universe_screen.main, stock_evaluator.batch_main, rmt_cluster.main,
 position_sizer.main), and --detail hands off to stock_evaluator's existing
-single-ticker report.
+single-ticker report. Paths, atomic JSON writes and number coercion come from
+stocks_common.py rather than being copied in.
+
+Every completed run is snapshotted to data\archive\<timestamp>\, and the
+newest --archive-keep of those are retained (30 by default). A snapshot is a
+full copy of the five JSON files and scored_candidates.json alone runs to tens
+of megabytes on a few-thousand-name universe, so without a bound the archive
+becomes the largest thing in the project. Only the most recent run is ever read
+back, by position_sizer's exit review.
 
 Setup:
     pip install yfinance curl_cffi requests numpy pandas
@@ -37,6 +53,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -44,7 +61,9 @@ from pathlib import Path
 from typing import Optional
 
 
-def _add_script_dir_to_path():
+# Identical in every stage, and not factorable into stocks_common: it is what
+# makes stocks_common importable in the first place.
+def _add_project_dir_to_path():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
         if (candidate / "market_data.py").exists():
@@ -56,9 +75,10 @@ def _add_script_dir_to_path():
     return here
 
 
-SCRIPT_DIR = _add_script_dir_to_path()
+SCRIPT_DIR = _add_project_dir_to_path()
 
 import market_data as md                     # noqa: E402
+import stocks_common as common               # noqa: E402
 import universe_screen                       # noqa: E402
 import stock_evaluator                       # noqa: E402
 import rmt_cluster                           # noqa: E402
@@ -100,13 +120,14 @@ def h(text):
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 
 CANDIDATES = DATA_DIR / "candidates.json"
 SCORED = DATA_DIR / "scored_candidates.json"
 SENTIMENT = DATA_DIR / "sentiment.json"
 CLUSTERED = DATA_DIR / "clustered.json"
 SIZED = DATA_DIR / "sized_candidates.json"
+RUN_STATUS = DATA_DIR / "run_status.json"
 ARCHIVE_DIR = DATA_DIR / "archive"
 
 # How many survivors get a sentiment pull, and how hard that stage is allowed
@@ -145,22 +166,12 @@ SECTOR_ETF_CA = {
 DISCLAIMER = "⚠  For informational use only. Not financial advice."
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # ─── FRESHNESS ─────────────────────────────────────────────────────────────
 
-def read_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+read_json = common.read_json
 
 
 def file_age_seconds(path):
@@ -352,40 +363,109 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
 
 
 def write_json(document, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(document, f, indent=2, ensure_ascii=False, default=str)
-    os.replace(tmp, output_path)
-    return output_path
+    return common.write_json(document, output_path, default=str)
 
 
 # ─── PIPELINE ──────────────────────────────────────────────────────────────
 
+def _output_stamp(path):
+    """(mtime_ns, size) for a stage's output, or None when it is not there.
+
+    Compared either side of a stage to tell "wrote a new file" from "left the
+    old one alone", which is the difference between a stage that worked and
+    one that quietly did not.
+    """
+    try:
+        info = Path(path).stat()
+        return (info.st_mtime_ns, info.st_size)
+    except OSError:
+        return None
+
+
 def run_pipeline(args):
-    """Run the stale stages in order. Returns a list of per-stage status rows."""
+    """Run the stale stages in order. Returns a list of per-stage status rows.
+
+    Every stage runner returns its entry point's exit code, and a required
+    stage that fails stops the pipeline. That has to be explicit, because the
+    failure modes here are quiet ones: universe_screen returns 1 and leaves
+    yesterday's candidates.json in place, stock_evaluator returns 2 when its
+    input is missing, and neither prints anything a later stage would notice.
+    Running on regardless meant the report rendered yesterday's data under
+    today's timestamp - the one outcome worse than an error.
+    """
     status = []
     downstream_forced = bool(args.force)
+    halted = False
 
-    def stage(name, output, ttl, runner, label):
-        nonlocal downstream_forced
+    def stage(name, output, ttl, runner, label, required=True):
+        """Run one stage unless its output is still fresh.
+
+        `runner` returns an exit code; anything non-zero, an exception, or a
+        missing output file afterwards is a failure. A required stage failing
+        halts everything after it, since those stages read what this one was
+        supposed to write.
+        """
+        nonlocal downstream_forced, halted
+
+        if halted:
+            status.append({"stage": name, "action": "not attempted",
+                           "age": file_age_seconds(output), "output": str(output),
+                           "ok": None})
+            if not args.quiet:
+                print(f"  {D}·{X} {label:<22} not attempted - an earlier stage failed")
+            return False
+
         age = file_age_seconds(output)
         fresh = is_fresh(output, ttl) and not downstream_forced
         if fresh:
             status.append({"stage": name, "action": "skipped (fresh)",
-                           "age": age, "output": str(output)})
+                           "age": age, "output": str(output), "ok": True})
             if not args.quiet:
                 print(f"  {G}✓{X} {label:<22} fresh ({describe_age(age)}) - not re-run")
             return False
+
         reason = "forced" if downstream_forced else ("missing" if age is None else "stale")
         if not args.quiet:
             print(f"  {C}→{X} {label:<22} {reason} - running")
-        runner()
+
+        detail = None
+        before = _output_stamp(output)
+        try:
+            code = runner()
+        except Exception as exc:                      # noqa: BLE001
+            code, detail = 1, f"{type(exc).__name__}: {exc}"
+        else:
+            if code not in (0, None):
+                detail = f"exit code {code}"
+            elif _output_stamp(output) == before:
+                # A stage can return 0 and still leave its output untouched.
+                # Checking only for existence misses the case that matters,
+                # because the file usually DOES exist - it is the previous
+                # run's, which universe_screen deliberately keeps when it
+                # aborts. An unchanged output means this stage produced
+                # nothing, whatever it returned.
+                detail = (f"{Path(output).name} was not written "
+                          f"(unchanged since before the stage ran)")
+
+        if detail:
+            status.append({"stage": name, "action": f"FAILED ({detail})",
+                           "age": file_age_seconds(output), "output": str(output),
+                           "ok": False, "required": required, "detail": detail})
+            if not args.quiet:
+                tint = R if required else Y
+                print(f"  {tint}✗{X} {label:<22} failed - {detail}")
+            if required:
+                halted = True
+                if not args.quiet:
+                    print(f"  {R}stopping: every stage after this one reads what "
+                          f"{label} was supposed to write.{X}")
+            return False
+
         # Everything after this stage is now working from new inputs.
         downstream_forced = True
         status.append({"stage": name, "action": f"ran ({reason})",
-                       "age": file_age_seconds(output), "output": str(output)})
+                       "age": file_age_seconds(output), "output": str(output),
+                       "ok": True})
         return True
 
     if not args.quiet:
@@ -400,7 +480,7 @@ def run_pipeline(args):
             argv.append("--include-canada")
         if args.refresh_prices:
             argv.append("--refresh")
-        universe_screen.main(argv)
+        return universe_screen.main(argv)
     stage("universe", CANDIDATES, md.TTL_SCREENER, _universe, "universe_screen")
 
     # 2. evaluator (batch)
@@ -409,10 +489,13 @@ def run_pipeline(args):
         if args.evaluate_limit:
             argv += ["--limit", str(args.evaluate_limit)]
         if args.account_size:
-            argv += ["--account-size", str(args.account_size)]
+            argv += ["--account-size", str(args.account_size),
+                     "--account-currency", str(args.account_currency)]
+        if args.workers:
+            argv += ["--workers", str(args.workers)]
         if args.refresh_prices:
             argv.append("--refresh")
-        stock_evaluator.batch_main(argv)
+        return stock_evaluator.batch_main(argv)
     stage("evaluate", SCORED, md.TTL_PRICE, _evaluate, "stock_evaluator")
 
     # 3. sentiment over the survivors only
@@ -421,8 +504,15 @@ def run_pipeline(args):
         survivors = sorted((scored.get("scored") or []),
                            key=lambda r: -(_num(r.get("composite")) or 0))
         tickers = [r["ticker"] for r in survivors[:args.sentiment_top]]
-        run_sentiment_stage(tickers, force_refresh=args.refresh_prices, quiet=args.quiet)
-    stage("sentiment", SENTIMENT, md.TTL_PRICE, _sentiment, "sentiment")
+        document = run_sentiment_stage(tickers, force_refresh=args.refresh_prices,
+                                       quiet=args.quiet)
+        # Sentiment is the one optional stage. It reports a failure so the run
+        # is honest about it, but does not halt the pipeline: position_sizer
+        # already has an answer for a name with no sentiment on file, and it is
+        # *_unverified rather than a crash.
+        return 0 if document.get("sentiment") or not tickers else 1
+    stage("sentiment", SENTIMENT, md.TTL_PRICE, _sentiment, "sentiment",
+          required=False)
 
     # 4. correlation clusters
     def _cluster():
@@ -433,7 +523,7 @@ def run_pipeline(args):
             argv += ["--min-composite", str(args.min_composite)]
         if args.refresh_prices:
             argv.append("--refresh")
-        rmt_cluster.main(argv)
+        return rmt_cluster.main(argv)
     stage("cluster", CLUSTERED, md.TTL_PRICE, _cluster, "rmt_cluster")
 
     # 5. sizing against holdings
@@ -443,23 +533,108 @@ def run_pipeline(args):
             argv += ["--top", str(args.top)]
         if args.refresh_prices:
             argv.append("--refresh")
-        position_sizer.main(argv)
+        return position_sizer.main(argv)
     stage("size", SIZED, md.TTL_PRICE, _size, "position_sizer")
 
     return status
 
 
+def write_run_status(status, args, output_path=RUN_STATUS):
+    """Record what each stage did, so a reader other than this terminal can see.
+
+    run_pipeline knows when a stage failed and says so on stdout, but that is
+    the only place it was ever said. stock_view reads this directory and had no
+    way to tell a scan that completed from one that halted at stage two and
+    left four stale files behind - which is exactly the situation where it most
+    needs to stop presenting them as today's numbers.
+    """
+    failed = [row for row in status if row.get("ok") is False]
+    blocking = [row for row in failed if row.get("required", True)]
+    document = {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "completed": not blocking,
+        "ok": not failed,
+        "stages": status,
+        "failed_stages": [row["stage"] for row in failed],
+        "blocking_stages": [row["stage"] for row in blocking],
+        "invocation": {
+            "force": bool(args.force),
+            "render_only": bool(args.render_only),
+            "include_canada": bool(args.include_canada),
+            "top": args.top,
+            "evaluate_limit": args.evaluate_limit,
+            "sentiment_top": args.sentiment_top,
+        },
+    }
+    return write_json(document, output_path)
+
+
 # ─── ARCHIVE ───────────────────────────────────────────────────────────────
 
-def archive_run(status, quiet=False):
+# Runs kept under data\archive\. Each is a full copy of the scan's five JSON
+# files, and scored_candidates.json alone runs to tens of megabytes on a
+# few-thousand-name universe, so an unbounded archive quietly becomes the
+# largest thing in the project. The exit review only ever reads the most
+# recent one; the rest are history, and a month of it is plenty.
+DEFAULT_ARCHIVE_KEEP = 30
+
+# data\archive\2026-08-31T02-19-07 - only folders this shape are ever pruned,
+# so anything a person filed there by hand is left alone.
+_ARCHIVE_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
+
+
+def prune_archive(keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
+    """Delete all but the newest `keep` archived runs. Returns how many went.
+
+    Names sort chronologically because the stamp is ISO-ordered, so the newest
+    are simply the last ones. keep=0 or None disables pruning entirely.
+    """
+    if not keep or keep <= 0 or not ARCHIVE_DIR.is_dir():
+        return 0
+    runs = sorted(d for d in ARCHIVE_DIR.iterdir()
+                  if d.is_dir() and _ARCHIVE_STAMP_RE.match(d.name))
+    stale = runs[:-keep] if len(runs) > keep else []
+    removed = 0
+    for run in stale:
+        try:
+            shutil.rmtree(run)
+            removed += 1
+        except OSError as e:
+            if not quiet:
+                print(f"  {Y}could not prune archive/{run.name}: {e}{X}")
+    if removed and not quiet:
+        print(f"  {D}pruned {removed} archived run(s), keeping the newest {keep}{X}")
+    return removed
+
+
+def archive_run(status, keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
     """Snapshot this run's outputs to data\\archive\\<timestamp>\\.
 
     Only when something actually re-ran - re-rendering yesterday's files does
     not create a new day's history. Without this there is no way to ask later
     how a scan's picks actually did, and the exit review has nothing to
     measure a holding's score against.
+
+    And only when no REQUIRED stage failed. A halted run leaves a mix of new
+    and stale files on disk; archiving that mix as one snapshot puts it at the
+    front of the archive, where latest_archive_scores() picks it up and the
+    exit review then reports "composite fell 2.1 since the last scan" against a
+    scan that never finished.
+
+    Sentiment is exempt because it is exempt everywhere: it fails routinely
+    when Reddit rate-limits, and refusing to archive over it would starve the
+    exit review of the history it needs for exactly the runs where the rest of
+    the pipeline worked fine.
     """
     if not any(row["action"].startswith("ran") for row in status):
+        return None
+    failed = [row for row in status
+              if row.get("ok") is False and row.get("required", True)]
+    if failed:
+        if not quiet:
+            names = ", ".join(row["stage"] for row in failed)
+            print(f"  {Y}not archiving: {names} failed, so this run's files are a "
+                  f"mix of new and stale{X}")
         return None
 
     stamp = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -467,7 +642,7 @@ def archive_run(status, quiet=False):
     target.mkdir(parents=True, exist_ok=True)
 
     copied = []
-    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED):
+    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED, RUN_STATUS):
         if path.exists():
             try:
                 shutil.copy2(path, target / path.name)
@@ -483,6 +658,7 @@ def archive_run(status, quiet=False):
         return None
     if not quiet:
         print(f"  {D}archived {len(copied)} file(s) to archive/{stamp}{X}")
+    prune_archive(keep=keep, quiet=quiet)
     return target
 
 
@@ -514,11 +690,18 @@ def flag_cells(candidate, sentiment):
     else:
         cells.append(f"{G}✓liq{X}")
 
-    trend = candidate.get("roa_trend_consistent")
-    if trend is True:
+    # roa_trend, not roa_trend_consistent. The strict flag demanded a
+    # non-decreasing ROA in every year it had, so it went red on one soft year
+    # in four and stayed green for a two-year-old listing that only had a
+    # single step to clear - the same business reading worse for having
+    # reported longer. The graded one says which way the series actually went.
+    trend = candidate.get("roa_trend")
+    if trend in ("improving", "flat"):
         cells.append(f"{G}✓trend{X}")
-    elif trend is False:
+    elif trend == "deteriorating":
         cells.append(f"{R}✗trend{X}")
+    elif trend == "mixed":
+        cells.append(f"{Y}~trend{X}")
     else:
         cells.append(f"{D}·trend{X}")
 
@@ -714,8 +897,8 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
     print()
     rule("─")
     h("LEGEND")
-    print(f"  {G}✓liq{X}/{R}✗liq{X} liquidity · {G}✓trend{X}/{R}✗trend{X}/{D}·trend{X} "
-          f"multi-year ROA (dot = insufficient history)")
+    print(f"  {G}✓liq{X}/{R}✗liq{X} liquidity · {G}✓trend{X} ROA improving or flat · "
+          f"{R}✗trend{X} declining · {Y}~trend{X} mixed · {D}·trend{X} too little history")
     print(f"  {G}disconnect+{X} price low, trend intact, public read agrees · "
           f"{Y}disconnect?{X} sentiment contests it · {G}disconnect·{X} no sentiment")
     print(f"  {R}value-trap!{X} trend and sentiment both negative · {R}trap-hype{X} "
@@ -751,6 +934,10 @@ def main(argv=None):
                         help="cap how many screened candidates get scored")
     parser.add_argument("--account-size", type=float, metavar="AMOUNT",
                         help="account size for the evaluator's liquidity gate")
+    parser.add_argument("--account-currency", default="USD", metavar="CODE",
+                        help="currency the account size is in (default USD). The "
+                             "liquidity gate converts each name's dollar volume "
+                             "into this before comparing.")
     parser.add_argument("--top", type=int, metavar="N",
                         help="shortlist size for clustering and sizing")
     parser.add_argument("--min-composite", type=float, metavar="SCORE")
@@ -759,6 +946,13 @@ def main(argv=None):
                              f"(default {SENTIMENT_TOP})")
     parser.add_argument("--no-archive", action="store_true",
                         help="do not snapshot this run to data/archive/<timestamp>/")
+    parser.add_argument("--archive-keep", type=int, default=DEFAULT_ARCHIVE_KEEP,
+                        metavar="N",
+                        help=f"how many archived runs to keep (default "
+                             f"{DEFAULT_ARCHIVE_KEEP}; 0 keeps every one)")
+    parser.add_argument("--workers", type=int, metavar="N",
+                        help="score N tickers at once in the evaluator stage "
+                             "(default 1; Yahoo rate-limits, so raise it carefully)")
     parser.add_argument("--show-stages", action="store_true",
                         help="list each stage's action in the report footer")
     parser.add_argument("--quiet", action="store_true", help="suppress stage progress")
@@ -781,8 +975,10 @@ def main(argv=None):
                   f"{DATA_DIR}{X}")
     else:
         status = run_pipeline(args)
+        # Before archiving, so the snapshot carries the run's own verdict.
+        write_run_status(status, args)
         if not args.no_archive:
-            archive_run(status, quiet=args.quiet)
+            archive_run(status, keep=args.archive_keep, quiet=args.quiet)
 
     sized_doc = read_json(SIZED)
     if sized_doc is None:
@@ -792,6 +988,33 @@ def main(argv=None):
 
     render_report(sized_doc, read_json(SCORED), read_json(SENTIMENT),
                   read_json(CLUSTERED), status, args)
+
+    # A halted run still renders - what is on disk is the last good scan and is
+    # worth reading - but it says which stage stopped it, and exits non-zero
+    # when a required one did, so a scheduled run fails visibly instead of
+    # reporting stale data as today's. A failed sentiment stage is reported and
+    # does not change the exit code: the scan itself completed.
+    failed = [row for row in status if row.get("ok") is False]
+    if not failed:
+        return 0
+
+    blocking = [row for row in failed if row.get("required", True)]
+    print(f"  {R if blocking else Y}This run did not complete"
+          f"{'' if blocking else ' in full'}.{X}")
+    for row in failed:
+        tint = R if row.get("required", True) else Y
+        optional = "" if row.get("required", True) else " (optional stage)"
+        print(f"    {tint}✗{X} {row['stage']}: {row.get('detail') or row['action']}"
+              f"{optional}")
+    skipped = [row for row in status if row["action"] == "not attempted"]
+    if skipped:
+        print(f"    {D}not attempted: "
+              f"{', '.join(row['stage'] for row in skipped)}{X}")
+    if blocking:
+        print(f"  {Y}The report above is rendered from the files already on disk, "
+              f"which are older than this run.{X}\n")
+        return 1
+    print()
     return 0
 
 

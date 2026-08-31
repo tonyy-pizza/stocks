@@ -1,0 +1,13 @@
+# Windows script files must keep CRLF endings on checkout.
+#
+# cmd.exe parses a .bat line by line as it runs it, and a label or a goto that
+# ends in a bare LF can be misread - which produces the worst kind of failure,
+# one that works on one machine and silently jumps to the wrong place on
+# another. Nothing about that is obvious from reading the file, so it is
+# pinned here rather than left to whatever core.autocrlf happens to be set to.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Icons are binary; never touch them.
+*.ico  binary

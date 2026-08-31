@@ -114,7 +114,10 @@ def _frameworks(frameworks):
             st.caption(f"⚠ {magic['warning']}")
 
     dcf = frameworks.get("dcf")
-    if dcf:
+    if dcf and dcf.get("not_applicable"):
+        st.markdown("**DCF scenarios**")
+        st.caption(f"Not applicable — {dcf.get('reason')}")
+    elif dcf:
         st.markdown("**DCF scenarios**")
         rows = []
         for name in ("bear", "base", "bull"):
@@ -187,14 +190,39 @@ def render(scan):
                      help=scores.get("interpretation") or "from sentiment.json")
 
     dims = candidate.get("dims") or {}
+    coverage_detail = ((candidate.get("coverage_detail")
+                        or (scan.scored_record(ticker) or {}).get("coverage_detail")) or {})
+    by_dimension = coverage_detail.get("by_dimension") or {}
+
     if dims:
         st.markdown("**Dimension breakdown**")
         for dim, value in dims.items():
             value = d.num(value)
+            # How much of each dimension was really measured, next to the score
+            # it produced. A 5.0 built from one input of five is the default
+            # showing through, not a verdict, and the two look identical
+            # without this.
+            got = by_dimension.get(dim) or {}
+            inputs = (f" <span style='color:{d.DIM}'>&nbsp;{got['available']}/"
+                      f"{got['total']} inputs</span>") if got else ""
             st.markdown(
                 f"<code>{dim:<14}</code> <code>{d.bar(value, 18)}</code> "
-                f"{d.score_html(value)}",
+                f"{d.score_html(value)}{inputs}",
                 unsafe_allow_html=True)
+
+    overall = d.num(candidate.get("data_coverage")) or d.num(coverage_detail.get("overall"))
+    if overall is not None:
+        available = coverage_detail.get("available")
+        total = coverage_detail.get("total")
+        counted = f" ({available} of {total} inputs)" if available and total else ""
+        if overall < d.LOW_COVERAGE:
+            st.warning(
+                f"**Thin data — {d.coverage_label(overall)} coverage{counted}.** "
+                f"Missing inputs score a neutral 5.0, so this composite is closer "
+                f"to a default than to a reading of the company. "
+                f"stock_evaluator flags it and it loses the top size band.", icon="⚠")
+        else:
+            st.caption(f"Data coverage {d.coverage_label(overall)}{counted}.")
 
     sizing = candidate.get("sizing") or {}
     st.markdown("**Sizing as the pipeline wrote it**")
@@ -229,6 +257,44 @@ def render(scan):
             ]).sort_values("raw", ascending=False)
             st.dataframe(frame.style.format({"raw": "{:.4f}", "cleaned": "{:.4f}"}),
                          width="stretch", hide_index=True)
+
+    liquidity = (candidate.get("liquidity")
+                 or (scan.scored_record(ticker) or {}).get("liquidity")) or {}
+    if liquidity.get("evaluated"):
+        st.markdown("**Liquidity**")
+        share = d.num(liquidity.get("position_pct_of_adv"))
+        cap = d.num(liquidity.get("max_adv_pct"))
+        cells = st.columns(3)
+        cells[0].metric(
+            "One position, as a share of a day's volume",
+            "n/a" if share is None else f"{share * 100:.2f}%",
+            help="A hypothetical position of position_pct of the account, against "
+                 "average daily dollar volume. A flag, never an exclusion.")
+        cells[1].metric("Flagged above", "n/a" if cap is None else f"{cap * 100:.2f}%")
+        cells[2].metric("Thin?", "yes" if candidate.get("liquidity_flag") else "no")
+
+        quote = liquidity.get("quote_currency")
+        account = liquidity.get("account_currency")
+        native = d.num(liquidity.get("avg_daily_dollar_volume"))
+        converted = d.num(liquidity.get("avg_daily_dollar_volume_account"))
+        rate = d.num(liquidity.get("fx_rate"))
+
+        # Worth showing both sides when they differ. The two halves of this
+        # ratio are quoted in different currencies - volume in the stock's,
+        # the position in the account's - and dividing them unconverted
+        # overstated a TSX name's liquidity in a USD account by the whole
+        # exchange rate.
+        if native is not None:
+            line = f"Average daily dollar volume {d.money(native)} {quote or ''}".strip()
+            if converted is not None and rate is not None and rate != 1.0:
+                line += (f"  →  {d.money(converted)} {account} "
+                         f"at {rate:.4f} {quote}→{account}")
+            st.caption(line)
+        if liquidity.get("fx_note") and not liquidity.get("fx_adjusted"):
+            st.warning(liquidity["fx_note"], icon="⚠")
+    elif liquidity.get("note"):
+        st.markdown("**Liquidity**")
+        st.caption(liquidity["note"])
 
     warnings = candidate.get("warnings") or []
     if warnings:

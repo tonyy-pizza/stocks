@@ -117,19 +117,60 @@ def liquidity_label(candidate: dict) -> str:
     return "✗ thin" if candidate.get("liquidity_flag") else "✓ ok"
 
 
-def trend_label(candidate: dict) -> str:
-    """flag_cells()'s trend cell. The dot means insufficient history, not False.
+TREND_LABELS = {
+    "improving": "✓ improving",
+    "flat": "✓ flat",
+    "deteriorating": "✗ declining",
+    "mixed": "~ mixed",
+}
 
-    Worth keeping distinct: stock_evaluator's roa_trend_consistent demands a
-    non-decreasing ROA in every year it has, so None (too few years) and False
-    (a real down year) mean genuinely different things.
+TREND_HELP = (
+    "Direction of multi-year ROA, from stock_evaluator.roa_trend: the share of "
+    "year-over-year steps that improved plus the overall first-to-last change. "
+    "'·' means too little history to say, which is not the same as a decline. "
+    "This replaced roa_trend_consistent, which demanded a non-decreasing ROA in "
+    "every single year and so read worse the more history a company had."
+)
+
+
+def trend_label(candidate: dict) -> str:
+    """flag_cells()'s trend cell, on the graded roa_trend.
+
+    The dot still means insufficient history rather than a failure, and there
+    is now a fourth state: 'mixed', where the endpoints and the year-to-year
+    steps disagree because one spike or trough is doing the work. Calling that
+    either a rise or a decline would be overstating what the series says.
     """
-    trend = candidate.get("roa_trend_consistent")
-    if trend is True:
-        return "✓ trend"
-    if trend is False:
-        return "✗ trend"
-    return "· trend"
+    return TREND_LABELS.get(candidate.get("roa_trend"), "· trend")
+
+
+def coverage_label(value) -> str:
+    """Share of scoring inputs that were actually available, as a percentage."""
+    value = num(value)
+    return "n/a" if value is None else f"{value * 100:.0f}%"
+
+
+# stock_evaluator.LOW_COVERAGE - below this a composite is mostly score()'s
+# neutral 5.0 default rather than a reading of the company.
+LOW_COVERAGE = 0.60
+
+COVERAGE_HELP = (
+    "Share of the 24-25 scoring inputs this ticker actually had. Missing inputs "
+    "score a neutral 5.0, so a composite built from a handful of them is closer "
+    "to a default than to a judgement. Below "
+    f"{LOW_COVERAGE * 100:.0f}% stock_evaluator raises a 'thin data' risk flag, "
+    "which costs the name its top position-size band."
+)
+
+
+def coverage_css(value) -> str:
+    """Amber below the thin-data threshold, dim when unknown."""
+    value = num(value)
+    if value is None:
+        return f"color: {DIM}"
+    if value < LOW_COVERAGE:
+        return f"color: {YELLOW}"
+    return ""
 
 
 DIVERGENCE_LABELS = {

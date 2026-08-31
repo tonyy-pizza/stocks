@@ -59,26 +59,29 @@ import numpy as np
 import pandas as pd
 
 
-# market_data.py sits next to this script (C:\Users\joey\stocks\).
-def _import_market_data():
+# market_data.py sits next to this script (C:\Users\joey\stocks\). This
+# four-line search is identical in every stage and cannot be factored into
+# stocks_common, because it is what makes stocks_common importable.
+def _add_project_dir_to_path():
     here = Path(__file__).resolve().parent
     for candidate in (here, here.parent / "stocks", here.parent):
         if (candidate / "market_data.py").exists():
             if str(candidate) not in sys.path:
                 sys.path.insert(0, str(candidate))
-            break
-    import market_data
-    return market_data
+            return
 
 
-md = _import_market_data()
+_add_project_dir_to_path()
+
+import market_data as md                                    # noqa: E402
+import stocks_common as common                              # noqa: E402
 
 
 # -------------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("STOCKS_DATA_DIR") or (Path(md.BASE_DIR) / "data"))
+DATA_DIR = common.data_dir(md.BASE_DIR)
 INPUT_PATH = DATA_DIR / "scored_candidates.json"
 OUTPUT_PATH = DATA_DIR / "clustered.json"
 
@@ -133,15 +136,10 @@ MIN_CLUSTER_SIZE = 2
 # is not meaningful. stdev and range are still reported, as description.
 MIN_WINNER_GAP = 0.5     # best vs runner-up
 MIN_WINNER_LEAD = 1.0    # best vs the median of the rest
-DISPERSION_THRESHOLD = MIN_WINNER_LEAD   # kept for callers that pass it in
+DISPERSION_THRESHOLD = MIN_WINNER_LEAD   # the CLI default for --dispersion
 
 
-def _num(value) -> Optional[float]:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(out) else out
+_num = common.num
 
 
 # -------------------------------------------------------------------------
@@ -392,8 +390,15 @@ def extract_clusters(decomp, tickers, loading_k=LOADING_K, min_corr=MIN_CLUSTER_
     return clusters, rejected
 
 
-def resolve_cluster(cluster, scores):
+def resolve_cluster(cluster, scores, min_gap=None, min_lead=None):
     """Do the members deserve the same verdict, or is one of them the pick?
+
+    The two thresholds are arguments rather than module globals. They used to
+    be read straight off MIN_WINNER_GAP / MIN_WINNER_LEAD, which meant
+    cluster_shortlist() had to REASSIGN those globals to honour --dispersion -
+    and never put them back. Any second call in the same process inherited the
+    first call's threshold, whatever it asked for, and scan_report imports this
+    module rather than shelling out to it.
 
     Low score dispersion means the cluster is an industry call - the members
     are near-interchangeable and the decision is whether to own the theme at
@@ -401,6 +406,9 @@ def resolve_cluster(cluster, scores):
     is the pick and the rest are demoted (kept in the output: a demoted peer is
     still a name you looked at, and may matter if the winner becomes untradeable).
     """
+    min_gap = MIN_WINNER_GAP if min_gap is None else min_gap
+    min_lead = MIN_WINNER_LEAD if min_lead is None else min_lead
+
     members = cluster["members"]
     member_scores = {t: scores.get(t) for t in members}
     usable = {t: s for t, s in member_scores.items() if s is not None}
@@ -425,7 +433,7 @@ def resolve_cluster(cluster, scores):
     cluster["winner_gap"] = round(gap, 4)
     cluster["winner_lead"] = round(lead, 4)
 
-    if gap >= MIN_WINNER_GAP and lead >= MIN_WINNER_LEAD:
+    if gap >= min_gap and lead >= min_lead:
         winner = max(sorted(usable), key=lambda t: usable[t])
         cluster.update({
             "resolution": "pick_winner",
@@ -435,12 +443,12 @@ def resolve_cluster(cluster, scores):
                                 f"cluster by {lead:.2f}: a real standout"),
         })
     else:
-        if gap < MIN_WINNER_GAP:
-            why = (f"top two are {gap:.2f} apart, inside the {MIN_WINNER_GAP:.2f} "
+        if gap < min_gap:
+            why = (f"top two are {gap:.2f} apart, inside the {min_gap:.2f} "
                    f"resolution of the composite - no meaningful winner")
         else:
             why = (f"best name leads the rest by only {lead:.2f} "
-                   f"(under {MIN_WINNER_LEAD:.2f}): members score alike")
+                   f"(under {min_lead:.2f}): members score alike")
         cluster.update({
             "resolution": "industry_wide",
             "winner": None,
@@ -455,29 +463,15 @@ def resolve_cluster(cluster, scores):
 # -------------------------------------------------------------------------
 
 def write_json(document, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(output_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False, default=str)
-        os.replace(tmp_path, output_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return output_path
+    return common.write_json(document, output_path, default=str)
 
 
 def cluster_shortlist(input_path=None, output_path=None, top=None, min_composite=None,
                       lookback_years=None, loading_k=LOADING_K, min_corr=MIN_CLUSTER_CORR,
                       dispersion_threshold=None, force_refresh=False, quiet=False):
     """Read the scored shortlist, cluster it, write data\\clustered.json."""
-    global DISPERSION_THRESHOLD, MIN_WINNER_LEAD
-    if dispersion_threshold is not None:
-        DISPERSION_THRESHOLD = MIN_WINNER_LEAD = dispersion_threshold
+    winner_lead = (MIN_WINNER_LEAD if dispersion_threshold is None
+                   else float(dispersion_threshold))
 
     input_path = Path(input_path) if input_path else INPUT_PATH
     output_path = Path(output_path) if output_path else OUTPUT_PATH
@@ -505,7 +499,7 @@ def cluster_shortlist(input_path=None, output_path=None, top=None, min_composite
         "target_q": TARGET_Q,
         "loading_k": loading_k,
         "min_cluster_correlation": min_corr,
-        "dispersion_threshold": DISPERSION_THRESHOLD,
+        "dispersion_threshold": winner_lead,
         "min_names_for_clustering": MIN_NAMES_FOR_CLUSTERING,
     }
     standalone_notes = {}
@@ -592,7 +586,7 @@ def cluster_shortlist(input_path=None, output_path=None, top=None, min_composite
 
     clusters, rejected = extract_clusters(decomp, usable_tickers,
                                           loading_k=loading_k, min_corr=min_corr)
-    clusters = [resolve_cluster(c, scores) for c in clusters]
+    clusters = [resolve_cluster(c, scores, min_lead=winner_lead) for c in clusters]
 
     clustered = {t for c in clusters for t in c["members"]}
     standalone = sorted(set(tickers) - clustered)
