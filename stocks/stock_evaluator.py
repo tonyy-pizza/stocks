@@ -3,6 +3,35 @@
 Stock Investment Evaluator v5.4 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
 
+v5.4.2 — the analysis-logic pass. These change which names surface, not just
+which numbers are printed, so a scan from before is not comparable with one
+after:
+- trend_analysis() adds roa_trend, a GRADED direction (improving / flat /
+  deteriorating / mixed) from the share of year-over-year steps that improved
+  plus the overall change. roa_trend_consistent is kept and still reported, but
+  nothing judges on it any more: demanding a non-decreasing ROA in every year
+  means it fires more readily the more history a company has, so the same
+  business read worse for having reported longer.
+- divergence_pattern() counts CATEGORIES, not signals. Revenue-declining and
+  net-income-declining were two of five votes and the trap threshold was two,
+  so one soft year — revenue down, profit down with it — labelled a company a
+  value trap on its own and cost it 35–50% of its position size through the
+  conviction modifier. They are now one "latest year" category alongside
+  profitability, cash generation and balance sheet.
+- data_coverage() records what share of the scoring inputs a ticker actually
+  had. score() returns a neutral 5.0 for anything missing, so a name with
+  almost no data landed near 5.0 and read as a considered HOLD. It does not
+  touch the composite; below LOW_COVERAGE it raises a "thin data" risk flag,
+  which is how this codebase reduces size without disturbing the calibration.
+- liquidity_check() takes an fx_rate and converts a stock's dollar volume into
+  the account's currency before comparing. A TSX name's CAD volume measured
+  against a USD account overstated its liquidity by the whole exchange rate.
+  Without a rate it falls back to the old unconverted comparison and says so.
+- dcf_scenarios() abstains on negative free cash flow instead of returning a
+  large negative intrinsic value that build_scores read as "very expensive".
+  A cash burn is not an overpriced company, and it is already scored through
+  cash runway, FCF quality, growth and Piotroski.
+
 v5.4.1 fixes (the first one DOES move composites — see below):
 - PEG is read again. yfinance dropped `pegRatio` from .info in favour of
   `trailingPegRatio`, so m["peg"] had been None for every ticker: the report's
@@ -538,11 +567,32 @@ def insider_conviction(d):
         return None
 
 def dcf_scenarios(d, m):
-    """Bear/base/bull DCF with normalized FCF and beta-adjusted WACC."""
+    """Bear/base/bull DCF with normalized FCF and beta-adjusted WACC.
+
+    Abstains when free cash flow is negative. Growing a negative number for
+    five years and discounting it produces a negative intrinsic value and an
+    upside near -100%, which build_scores then read as "extremely expensive"
+    and folded into the frameworks average as a 1.0. That is a category error:
+    a cash-burning company is not the same thing as an overpriced one, and the
+    burn is already accounted for elsewhere - by the cash-runway warning, by
+    the FCF-quality and growth scores, and by Piotroski's FCF > 0 test. Scoring
+    it here as well charged the same fact twice, against the one metric that
+    could not measure it.
+
+    Returns {"not_applicable": True, "reason": ...}, which carries no "base"
+    key and so drops out of the frameworks average rather than dragging it.
+    """
     fcf0 = m.get("fcf_normalized") or m.get("fcf_latest")
     shares = m.get("shares")
     price = m.get("price")
     if not fcf0 or not shares: return None
+    if fcf0 < 0:
+        return {"not_applicable": True,
+                "fcf_used": fcf0,
+                "reason": ("free cash flow is negative; a discounted cash flow "
+                           "of a cash burn is not a valuation. The burn is "
+                           "scored through cash runway, FCF quality and growth "
+                           "instead.")}
 
     rules = srules(m.get("sector"))
     cyc = rules["cyc"]
@@ -654,6 +704,83 @@ def build_scores(m, pio, alt, gra, mag, dc):
     rating = rate(composite, dims)
     return {"composite": round(composite, 2), "dims": dims, "rating": rating}
 
+# The inputs each dimension's score is actually built from, matching
+# build_scores() line for line. Frameworks are counted separately below,
+# because their availability is a framework returning something at all.
+COVERAGE_INPUTS = {
+    "Valuation":     ("pe", "fwd_pe", "ev_ebitda", "ps", "pb"),
+    "Profitability": ("gross_margin", "op_margin", "roe", "roa", "roic"),
+    "Growth":        ("rev_growth", "eps_growth", "fcf_growth"),
+    "Health":        ("debt_eq", "curr_ratio", "quick_ratio", "int_coverage",
+                      "fcf_quality"),
+    "Momentum":      ("pos_52w",),
+}
+
+# Below this share of inputs, a composite is mostly score()'s neutral default
+# rather than a reading of the company.
+LOW_COVERAGE = 0.60
+
+
+def data_coverage(m, pio=None, alt=None, gra=None, mag=None, dc=None):
+    """What share of the scoring inputs this ticker actually had.
+
+    score() returns a neutral 5.0 for anything it cannot read. That is the right
+    default - it refuses to reward or punish a company for Yahoo's coverage of
+    it - but it has a consequence nothing was recording: a ticker with almost no
+    data lands near 5.0 and reads as a considered HOLD / WATCHLIST rather than
+    as an absence of information. A 5.4 built from four inputs and a 5.4 built
+    from twenty-four are not the same claim, and until now the file could not
+    tell them apart.
+
+    Informational only - it does not alter the composite, the same discipline
+    insider conviction, cash runway and the value screen follow. It does earn a
+    risk flag in position_guidance(), which is how this codebase says "size this
+    smaller" without disturbing the v3/v4 scoring calibration.
+
+    Writes m["data_coverage"] and m["coverage_detail"], and returns the detail.
+    """
+    by_dimension, available, total = {}, 0, 0
+
+    for dimension, keys in COVERAGE_INPUTS.items():
+        got = sum(1 for key in keys if num(m.get(key)) is not None)
+        # PEG only counts where it actually participates: build_scores drops it
+        # and renormalizes when it is missing or flagged unreliable.
+        if dimension == "Valuation" and m.get("peg") is not None and not m.get("peg_excluded"):
+            got, keys = got + 1, keys + ("peg",)
+        by_dimension[dimension] = {"available": got, "total": len(keys),
+                                   "share": round(got / len(keys), 4)}
+        available += got
+        total += len(keys)
+
+    # Frameworks: the same five build_scores() averages over.
+    frameworks = {
+        "piotroski": bool(pio),
+        "altman_z": bool(alt),
+        "graham": bool(gra and gra.get("mos") is not None),
+        "magic_formula": bool(mag),
+        "dcf": bool(dc and dc.get("base") and dc["base"].get("upside") is not None),
+    }
+    got = sum(1 for present in frameworks.values() if present)
+    by_dimension["Frameworks"] = {"available": got, "total": len(frameworks),
+                                  "share": round(got / len(frameworks), 4),
+                                  "which": frameworks}
+    available += got
+    total += len(frameworks)
+
+    overall = round(available / total, 4) if total else 0.0
+    detail = {"overall": overall, "available": available, "total": total,
+              "low_threshold": LOW_COVERAGE, "by_dimension": by_dimension}
+
+    m["data_coverage"] = overall
+    m["coverage_detail"] = detail
+    if overall < LOW_COVERAGE:
+        m.setdefault("warnings", []).append(
+            f"Thin data: {available} of {total} scoring inputs were available "
+            f"({overall*100:.0f}%). Missing inputs score a neutral 5.0, so this "
+            f"composite is closer to a default than to a reading.")
+    return detail
+
+
 def rate(comp, dims):
     if comp >= 8.0 and dims.get("Valuation", 10) < 6.0:
         return "QUALITY BUY, BUT VALUATION STRETCHED"
@@ -676,6 +803,12 @@ def position_guidance(m, sc, ins):
         flags.append("short cash runway")
     if ins and ins.get("verdict") == "Net selling":
         flags.append("insider net selling")
+    # A composite mostly made of score()'s neutral default is not a conviction,
+    # and the top size band is reserved for names with at most one flag - which
+    # is exactly the right place for "we barely have the data on this one".
+    coverage = num(m.get("data_coverage"))
+    if coverage is not None and coverage < LOW_COVERAGE:
+        flags.append(f"thin data ({coverage*100:.0f}% of inputs)")
 
     if comp >= 8.5 and len(flags) <= 1:
         guide = "Core: 3%–5%; up to 8% with diversification."
@@ -739,7 +872,9 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs):
         print(f"  Graham      ${gra['graham']}  {arrow}  {gra['mos']}% MoS  (px ${gra['price']})")
     if mag:
         print(f"  Magic Formula  EY {mag['ey']}%  ·  ROIC {mag['roic']}%  ·  Combined {mag['combined']}%")
-    if dc:
+    if dc and dc.get("not_applicable"):
+        print(f"  DCF Scenarios:  not applicable - {dc.get('reason')}")
+    elif dc:
         print("  DCF Scenarios:")
         for name in ("bear", "base", "bull"):
             s = dc.get(name)
@@ -920,6 +1055,11 @@ DEFAULT_MAX_ADV_PCT  = 0.01
 
 # "Bottom of the 52-week range" for the divergence check.
 DIVERGENCE_LOW_POS = 0.25
+
+# How much ROA has to move across the whole window before the direction counts
+# as a direction at all. ROA is a ratio, so this is 0.5 percentage points of
+# return on assets - below that the series is flat, not improving or declining.
+ROA_FLAT_BAND = 0.005
 
 INSUFFICIENT = "insufficient history"
 
@@ -1121,6 +1261,7 @@ def trend_analysis(d):
         return {
             "trend_years_available": years,
             "roa_trend_consistent": INSUFFICIENT,
+            "roa_trend": INSUFFICIENT,
             "fcf_positive_years": INSUFFICIENT,
             "debt_trend": INSUFFICIENT,
             "trend_detail": {"roa_by_year": [], "fcf_by_year": [], "debt_by_year": [],
@@ -1131,10 +1272,43 @@ def trend_analysis(d):
     fcf_valid = [v for v in fcf_series if v is not None]
     debt_valid = [v for v in debt_series if v is not None]
 
+    # Two readings of the same series, and the difference matters.
+    #
+    # roa_trend_consistent is the strict one: non-decreasing in EVERY year. It
+    # is kept because it is a real, precise statement, but it must not be the
+    # one anything judges on, because it is not comparable between names. It
+    # demands more the more history a company has - one down year in four makes
+    # it False, while a two-year-old listing only has to clear a single step -
+    # so the same business looks worse purely for having reported longer.
+    # position_sizer's exit review already says as much in a comment and works
+    # around it; divergence_pattern did not, and voted on it.
+    #
+    # roa_trend is the graded one: which direction the series actually went,
+    # from the share of year-over-year steps that improved and the overall
+    # first-to-last change. One down year inside a rising series reads
+    # "improving", which is what it is.
+    roa_consistent = INSUFFICIENT
+    roa_trend = INSUFFICIENT
+    roa_shape = {}
     if len(roa_valid) >= 2:
         roa_consistent = all(b >= a for a, b in zip(roa_valid, roa_valid[1:]))
-    else:
-        roa_consistent = INSUFFICIENT
+        steps = list(zip(roa_valid, roa_valid[1:]))
+        up = sum(1 for a, b in steps if b > a)
+        down = sum(1 for a, b in steps if b < a)
+        change = roa_valid[-1] - roa_valid[0]
+        roa_shape = {"steps": len(steps), "steps_up": up, "steps_down": down,
+                     "first": round(roa_valid[0], 6), "last": round(roa_valid[-1], 6),
+                     "change": round(change, 6), "flat_band": ROA_FLAT_BAND}
+        if abs(change) < ROA_FLAT_BAND:
+            roa_trend = "flat"
+        elif change > 0 and up >= down:
+            roa_trend = "improving"
+        elif change < 0 and down >= up:
+            roa_trend = "deteriorating"
+        else:
+            # The endpoints and the steps disagree - a spike or a trough is
+            # doing the work. Neither direction is a fair summary.
+            roa_trend = "mixed"
 
     fcf_positive = len([v for v in fcf_valid if v > 0]) if fcf_valid else INSUFFICIENT
 
@@ -1158,6 +1332,7 @@ def trend_analysis(d):
     return {
         "trend_years_available": years,
         "roa_trend_consistent": roa_consistent,
+        "roa_trend": roa_trend,
         "fcf_positive_years": fcf_positive,
         "debt_trend": debt_trend,
         "trend_detail": {
@@ -1166,6 +1341,7 @@ def trend_analysis(d):
             "debt_by_year": _round(debt_series),
             # Per-series counts: a series can be shorter than the window when
             # Yahoo omits a line item, so "N of M" is stated per series.
+            "roa_shape": roa_shape,
             "roa_years_available": len(roa_valid),
             "fcf_years_available": len(fcf_valid),
             "debt_years_available": len(debt_valid),
@@ -1179,14 +1355,24 @@ def liquidity_check(m, account_size=None,
                     position_pct=DEFAULT_POSITION_PCT,
                     max_adv_pct=DEFAULT_MAX_ADV_PCT,
                     account_currency=None,
-                    avg_volume_hint=None):
+                    avg_volume_hint=None,
+                    fx_rate=None):
     """How much of a normal trading day one position would be.
 
     A flag, never an exclusion: thin names stay in the scan and are marked so
     the reason is visible downstream instead of silently disappearing.
 
-    Dollar volume is in the stock's own quote currency. When that differs from
-    the account currency the comparison is not FX-adjusted, and says so.
+    The two sides of this ratio are quoted in different currencies. Dollar
+    volume is price x shares in the STOCK's currency; the position is a share
+    of the ACCOUNT, in the account's currency. Dividing one by the other
+    unconverted is a real error, not a rounding one: a TSX name's volume in CAD
+    measured against a USD account overstated its liquidity by the whole
+    exchange rate, so thin Canadian names read as tradeable in a US account and
+    the flag they should have raised never fired.
+
+    `fx_rate` converts the quote currency into the account currency. When it is
+    not supplied and the two differ, the comparison falls back to the old
+    unconverted one and says so rather than inventing a rate of 1.0.
     """
     result = {"evaluated": False, "account_size": account_size,
               "position_pct": position_pct, "max_adv_pct": max_adv_pct}
@@ -1201,9 +1387,18 @@ def liquidity_check(m, account_size=None,
         result["note"] = "price or average volume unavailable"
         return False, result
 
-    adv_value = price * volume
-    position_value = account_size * position_pct
-    share = sd(position_value, adv_value)
+    quote_currency = m.get("quote_currency")
+    adv_value = price * volume                       # in the quote currency
+    position_value = account_size * position_pct     # in the account currency
+
+    rate = num(fx_rate)
+    same_currency = bool(account_currency and quote_currency
+                         and str(account_currency).upper() == str(quote_currency).upper())
+    if same_currency:
+        rate = 1.0
+    adv_in_account = adv_value if rate is None else adv_value * rate
+
+    share = sd(position_value, adv_in_account)
     if share is None:
         result["note"] = "average daily dollar volume is zero"
         return False, result
@@ -1211,13 +1406,22 @@ def liquidity_check(m, account_size=None,
     result.update({
         "evaluated": True,
         "avg_daily_dollar_volume": round(adv_value, 2),
+        "avg_daily_dollar_volume_account": round(adv_in_account, 2),
         "position_value": round(position_value, 2),
         "position_pct_of_adv": round(share, 6),
-        "quote_currency": m.get("quote_currency"),
+        "quote_currency": quote_currency,
+        "account_currency": account_currency,
+        "fx_rate": rate,
+        "fx_adjusted": bool(rate is not None and not same_currency),
     })
-    if account_currency and m.get("quote_currency") and account_currency != m.get("quote_currency"):
-        result["fx_note"] = (f"dollar volume in {m['quote_currency']}, account in "
-                             f"{account_currency}; not FX-adjusted")
+    if not same_currency and account_currency and quote_currency:
+        if rate is None:
+            result["fx_note"] = (f"dollar volume in {quote_currency}, account in "
+                                 f"{account_currency}; no rate available, so this "
+                                 f"comparison is NOT FX-adjusted")
+        else:
+            result["fx_note"] = (f"dollar volume converted {quote_currency}->"
+                                 f"{account_currency} at {rate:.4f}")
 
     return bool(share > max_adv_pct), result
 
@@ -1246,51 +1450,126 @@ def divergence_pattern(m, trend, low_pos=DIVERGENCE_LOW_POS):
     deterioration = detail["deterioration"]
     holding_up = detail["holding_up"] = []
 
-    if trend.get("roa_trend_consistent") is False:
-        deterioration.append("ROA not holding up across available years")
-    elif trend.get("roa_trend_consistent") is True:
-        holding_up.append("ROA non-decreasing across available years")
+    # Signals are grouped into four INDEPENDENT categories, and the trap
+    # threshold counts categories rather than signals.
+    #
+    # It used to count signals, with revenue-declining and net-income-declining
+    # as two of the five. Those are not two findings, they are one bad year
+    # seen twice - revenue falls and profit falls with it - so a company whose
+    # only problem was a single soft year hit the two-signal threshold on its
+    # own and was labelled a value trap, which then cost it 35-50% of its
+    # position size through the conviction modifier. That is precisely the
+    # fundamentals-intact/price-depressed case the pipeline exists to find.
+    #
+    # Grouped, one soft year is one category and reads neutral; a soft year
+    # ALONGSIDE rising debt, or thin cash generation, still reads as a trap.
+    categories = {
+        "profitability": None,   # multi-year ROA direction
+        "cash_generation": None, # how often FCF was positive
+        "balance_sheet": None,   # where debt went over the window
+        "latest_year": None,     # revenue / net income in the most recent year
+    }
+
+    roa_trend = trend.get("roa_trend")
+    if roa_trend == "deteriorating":
+        categories["profitability"] = False
+        deterioration.append("ROA declining across available years")
+    elif roa_trend in ("improving", "flat"):
+        categories["profitability"] = True
+        holding_up.append(f"ROA {roa_trend} across available years")
 
     if isinstance(trend.get("fcf_positive_years"), int):
         fcf_years = (trend.get("trend_detail") or {}).get("fcf_years_available") or 0
         if fcf_years and trend["fcf_positive_years"] * 2 <= fcf_years:
+            categories["cash_generation"] = False
             deterioration.append(
                 f"FCF positive in only {trend['fcf_positive_years']} of {fcf_years} years")
         elif fcf_years:
+            categories["cash_generation"] = True
             holding_up.append(
                 f"FCF positive in {trend['fcf_positive_years']} of {fcf_years} years")
 
     if trend.get("debt_trend") == "increasing":
+        categories["balance_sheet"] = False
         deterioration.append("debt rising over the full window")
     elif trend.get("debt_trend") in ("decreasing", "flat"):
+        categories["balance_sheet"] = True
         holding_up.append(f"debt {trend['debt_trend']} over the full window")
 
+    # One category for the latest year, however many of its lines moved.
     rev_growth = num(m.get("rev_growth_raw"))
-    if rev_growth is not None:
-        (deterioration if rev_growth < 0 else holding_up).append(
-            f"revenue {'declining' if rev_growth < 0 else 'growing'} year over year")
     ni_growth = num(m.get("ni_growth"))
-    if ni_growth is not None:
-        (deterioration if ni_growth < 0 else holding_up).append(
-            f"net income {'declining' if ni_growth < 0 else 'growing'} year over year")
+    latest = [(label, value) for label, value in
+              (("revenue", rev_growth), ("net income", ni_growth)) if value is not None]
+    if latest:
+        falling = [label for label, value in latest if value < 0]
+        rising = [label for label, value in latest if value >= 0]
+        if falling:
+            categories["latest_year"] = False
+            deterioration.append(f"{' and '.join(falling)} declining year over year")
+            if rising:
+                holding_up.append(f"{' and '.join(rising)} still growing year over year")
+        else:
+            categories["latest_year"] = True
+            holding_up.append(f"{' and '.join(rising)} growing year over year")
 
-    if len(deterioration) >= 2:
+    failing = sorted(k for k, v in categories.items() if v is False)
+    passing = sorted(k for k, v in categories.items() if v is True)
+    detail["categories"] = categories
+    detail["deteriorating_categories"] = failing
+    detail["holding_up_categories"] = passing
+
+    if len(failing) >= 2:
+        detail["reason"] = (f"{len(failing)} independent categories deteriorating "
+                            f"({', '.join(failing)})")
         return "trend_confirms_decline", detail
-    if not deterioration and holding_up:
+    if not failing and passing:
+        detail["reason"] = (f"nothing deteriorating across {len(passing)} category "
+                            f"({', '.join(passing)})" if len(passing) == 1 else
+                            f"nothing deteriorating across {len(passing)} categories "
+                            f"({', '.join(passing)})")
         return "price_disconnect", detail
 
     # No deterioration but nothing holding up either: a recent IPO with no
     # usable history is not evidence that the business is fine.
-    detail["reason"] = ("one deterioration signal only; neither pattern is clear"
-                        if deterioration else
+    detail["reason"] = (f"only {failing[0]} is deteriorating; one category is not "
+                        f"enough to call a trap"
+                        if failing else
                         "no usable trend data to confirm the price move")
     return "neutral", detail
 
 
 # ─── SCORING ONE CANDIDATE ─────────────────────────────────────────────────
+def fx_rate_for(quote_currency, account_currency, cache=None):
+    """Rate converting a stock's quote currency into the account's, memoized.
+
+    Rates are per currency PAIR, not per ticker, so a whole batch of Canadian
+    names costs one lookup - and market_data caches that on disk for the day,
+    so a re-run costs none. `cache` is an ordinary dict the caller keeps for
+    the length of a run.
+    """
+    if not quote_currency or not account_currency:
+        return None
+    quote = str(quote_currency).strip().upper()
+    account = str(account_currency).strip().upper()
+    if not quote or not account:
+        return None
+    if quote == account:
+        return 1.0
+    if md is None:
+        return None
+    key = (quote, account)
+    if cache is None:
+        return md.get_fx_rate(quote, account)
+    if key not in cache:
+        cache[key] = md.get_fx_rate(quote, account)
+    return cache[key]
+
+
 def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT,
                     max_adv_pct=DEFAULT_MAX_ADV_PCT, account_currency=None,
-                    avg_volume_hint=None, include_insider=False, force_refresh=False):
+                    avg_volume_hint=None, include_insider=False, force_refresh=False,
+                    fx_cache=None):
     """Run one ticker through the existing pipeline, quietly.
 
     Same calls evaluate() makes, minus print_report(), plus the v5.4 fields.
@@ -1315,6 +1594,9 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
         ins = insider_conviction(data) if include_insider else None
         dc = dcf_scenarios(data, m)
         sc = build_scores(m, pio, alt, gra, mag, dc)
+        # Before position_guidance: it reads m["data_coverage"] for its
+        # thin-data risk flag.
+        coverage = data_coverage(m, pio, alt, gra, mag, dc)
         pos = position_guidance(m, sc, ins)
         vs = value_screen(m, sc["dims"])
 
@@ -1322,7 +1604,8 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
         liquidity_flag, liquidity = liquidity_check(
             m, account_size=account_size, position_pct=position_pct,
             max_adv_pct=max_adv_pct, account_currency=account_currency,
-            avg_volume_hint=avg_volume_hint)
+            avg_volume_hint=avg_volume_hint,
+            fx_rate=fx_rate_for(m.get("quote_currency"), account_currency, fx_cache))
         pattern, divergence = divergence_pattern(m, trend)
 
         if liquidity_flag:
@@ -1350,9 +1633,12 @@ def score_candidate(ticker, account_size=None, position_pct=DEFAULT_POSITION_PCT
             "position_guidance": pos,
             "value_screen": vs,
             "insider": ins,
+            "data_coverage": coverage["overall"],
+            "coverage_detail": coverage,
             # v5.4 additions
             "trend_years_available": trend["trend_years_available"],
             "roa_trend_consistent": trend["roa_trend_consistent"],
+            "roa_trend": trend["roa_trend"],
             "fcf_positive_years": trend["fcf_positive_years"],
             "debt_trend": trend["debt_trend"],
             "trend_detail": trend["trend_detail"],
@@ -1433,6 +1719,7 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
     scored, skipped = [], []
     total = len(candidates)
     started = datetime.now()
+    fx_cache = {}          # one entry per currency pair for the whole batch
 
     if not quiet:
         print(f"\n  {B}{C}Batch scoring {total} candidate(s){X}")
@@ -1454,7 +1741,8 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             account_size=account_size, position_pct=position_pct,
             max_adv_pct=max_adv_pct, account_currency=account_currency,
             avg_volume_hint=candidate.get("avg_volume"),
-            include_insider=include_insider, force_refresh=force_refresh)
+            include_insider=include_insider, force_refresh=force_refresh,
+            fx_cache=fx_cache)
 
         if record is None:
             skipped.append({"ticker": ticker, "reason": reason})
@@ -1484,6 +1772,11 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             "sectors": sorted(sectors) if sectors else None,
             "limit": limit,
             "include_insider": include_insider,
+            # Which rates the liquidity gate actually converted at, so a run is
+            # reproducible and an un-convertible currency is visible as a null
+            # rather than as a silently unconverted comparison.
+            "fx_rates": {f"{quote}->{account}": rate
+                         for (quote, account), rate in sorted(fx_cache.items())},
             "evaluator_version": "5.4",
         },
         "counts": {"candidates": total, "scored": len(scored), "skipped": len(skipped)},
@@ -1580,6 +1873,7 @@ def evaluate(ticker):
     ins = insider_conviction(data)
     dc  = dcf_scenarios(data, m)
     sc  = build_scores(m, pio, alt, gra, mag, dc)
+    data_coverage(m, pio, alt, gra, mag, dc)
     pos = position_guidance(m, sc, ins)
     vs  = value_screen(m, sc["dims"])
     print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs)

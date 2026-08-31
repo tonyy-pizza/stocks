@@ -679,18 +679,30 @@ def review_holdings(holdings, scored_records=None, previous=None,
                 verdict = "watch"
                 reasons.append(f"composite {composite:.2f} under {EXIT_WATCH_COMPOSITE:.1f}")
             else:
-                # roa_trend_consistent alone is far too sensitive to use here:
-                # it demands a non-decreasing ROA in every single year, so one
-                # down year in four makes it False and it reads as "watch" on
-                # names scoring 9+. Real deterioration is rising debt AND weak
-                # cash generation together.
+                # Two of the three independent trend categories have to be
+                # deteriorating before a scoring holding is worth a second look.
+                #
+                # This used to test rising debt AND weak cash generation only,
+                # as a deliberate workaround: the profitability signal available
+                # at the time was roa_trend_consistent, which demands a
+                # non-decreasing ROA in every single year and so read False on
+                # names scoring 9+ after one soft year. stock_evaluator now
+                # reports roa_trend, which grades the direction instead of
+                # requiring perfection, so profitability can take its place as a
+                # real third category - the same three divergence_pattern counts.
                 years = (record.get("trend_detail") or {}).get("fcf_years_available") or 0
                 positive = record.get("fcf_positive_years")
                 weak_fcf = isinstance(positive, int) and years and positive * 2 <= years
-                if record.get("debt_trend") == "increasing" and weak_fcf:
+                deteriorating = []
+                if record.get("roa_trend") == "deteriorating":
+                    deteriorating.append("ROA declining across the window")
+                if record.get("debt_trend") == "increasing":
+                    deteriorating.append("debt rising over the window")
+                if weak_fcf:
+                    deteriorating.append(f"FCF positive in only {positive} of {years} years")
+                if len(deteriorating) >= 2:
                     verdict = "watch"
-                    reasons.append(f"debt rising over the window and FCF positive in only "
-                                   f"{positive} of {years} years")
+                    reasons.append(" and ".join(deteriorating))
         if not reasons:
             reasons.append("fundamentals still support the position")
 
@@ -706,7 +718,9 @@ def review_holdings(holdings, scored_records=None, previous=None,
             "reasons": reasons,
             "divergence_pattern": record.get("divergence_pattern"),
             "roa_trend_consistent": record.get("roa_trend_consistent"),
+            "roa_trend": record.get("roa_trend"),
             "debt_trend": record.get("debt_trend"),
+            "data_coverage": record.get("data_coverage"),
             "warnings": record.get("warnings") or [],
         })
         if not quiet:
@@ -816,8 +830,10 @@ def size_shortlist(scored_path=None, clustered_path=None, holdings_path=None,
             "liquidity_flag": record.get("liquidity_flag"),
             "trend_years_available": record.get("trend_years_available"),
             "roa_trend_consistent": record.get("roa_trend_consistent"),
+            "roa_trend": record.get("roa_trend"),
             "fcf_positive_years": record.get("fcf_positive_years"),
             "debt_trend": record.get("debt_trend"),
+            "data_coverage": record.get("data_coverage"),
             "financials_as_of": record.get("financials_as_of"),
             "price_as_of": record.get("price_as_of"),
             "warnings": record.get("warnings") or [],

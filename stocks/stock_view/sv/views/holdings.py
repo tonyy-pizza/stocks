@@ -163,7 +163,9 @@ def render(scan):
             "Composite": d.num(review.get("composite")),
             "Δ since last scan": d.num(review.get("composite_delta")),
             "Rating": review.get("rating"),
+            "ROA trend": review.get("roa_trend"),
             "Debt trend": review.get("debt_trend"),
+            "Data": d.num(review.get("data_coverage")),
             "Why": reasons[0] if reasons else "",
         })
     review_frame = pd.DataFrame(rows)
@@ -171,9 +173,15 @@ def render(scan):
         review_frame.style
         .map(d.score_css, subset=["Composite"])
         .map(_verdict_css, subset=["Verdict"])
+        .map(d.coverage_css, subset=["Data"])
         .format({"Composite": lambda v: "n/a" if pd.isna(v) else f"{v:.2f}",
-                 "Δ since last scan": lambda v: "—" if pd.isna(v) else f"{v:+.2f}"}),
-        width="stretch", hide_index=True)
+                 "Δ since last scan": lambda v: "—" if pd.isna(v) else f"{v:+.2f}",
+                 "Data": lambda v: "n/a" if pd.isna(v) else f"{v * 100:.0f}%"}),
+        width="stretch", hide_index=True,
+        column_config={
+            "ROA trend": st.column_config.Column("ROA trend", help=d.TREND_HELP),
+            "Data": st.column_config.Column("Data", help=d.COVERAGE_HELP),
+        })
 
     flagged = [r for r in reviews if r.get("verdict") == "exit_review"]
     if flagged:

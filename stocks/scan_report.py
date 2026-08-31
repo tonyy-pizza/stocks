@@ -491,7 +491,8 @@ def run_pipeline(args):
         if args.evaluate_limit:
             argv += ["--limit", str(args.evaluate_limit)]
         if args.account_size:
-            argv += ["--account-size", str(args.account_size)]
+            argv += ["--account-size", str(args.account_size),
+                     "--account-currency", str(args.account_currency)]
         if args.refresh_prices:
             argv.append("--refresh")
         return stock_evaluator.batch_main(argv)
@@ -622,11 +623,18 @@ def flag_cells(candidate, sentiment):
     else:
         cells.append(f"{G}✓liq{X}")
 
-    trend = candidate.get("roa_trend_consistent")
-    if trend is True:
+    # roa_trend, not roa_trend_consistent. The strict flag demanded a
+    # non-decreasing ROA in every year it had, so it went red on one soft year
+    # in four and stayed green for a two-year-old listing that only had a
+    # single step to clear - the same business reading worse for having
+    # reported longer. The graded one says which way the series actually went.
+    trend = candidate.get("roa_trend")
+    if trend in ("improving", "flat"):
         cells.append(f"{G}✓trend{X}")
-    elif trend is False:
+    elif trend == "deteriorating":
         cells.append(f"{R}✗trend{X}")
+    elif trend == "mixed":
+        cells.append(f"{Y}~trend{X}")
     else:
         cells.append(f"{D}·trend{X}")
 
@@ -822,8 +830,8 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
     print()
     rule("─")
     h("LEGEND")
-    print(f"  {G}✓liq{X}/{R}✗liq{X} liquidity · {G}✓trend{X}/{R}✗trend{X}/{D}·trend{X} "
-          f"multi-year ROA (dot = insufficient history)")
+    print(f"  {G}✓liq{X}/{R}✗liq{X} liquidity · {G}✓trend{X} ROA improving or flat · "
+          f"{R}✗trend{X} declining · {Y}~trend{X} mixed · {D}·trend{X} too little history")
     print(f"  {G}disconnect+{X} price low, trend intact, public read agrees · "
           f"{Y}disconnect?{X} sentiment contests it · {G}disconnect·{X} no sentiment")
     print(f"  {R}value-trap!{X} trend and sentiment both negative · {R}trap-hype{X} "
@@ -859,6 +867,10 @@ def main(argv=None):
                         help="cap how many screened candidates get scored")
     parser.add_argument("--account-size", type=float, metavar="AMOUNT",
                         help="account size for the evaluator's liquidity gate")
+    parser.add_argument("--account-currency", default="USD", metavar="CODE",
+                        help="currency the account size is in (default USD). The "
+                             "liquidity gate converts each name's dollar volume "
+                             "into this before comparing.")
     parser.add_argument("--top", type=int, metavar="N",
                         help="shortlist size for clustering and sizing")
     parser.add_argument("--min-composite", type=float, metavar="SCORE")

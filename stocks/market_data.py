@@ -612,6 +612,46 @@ def get_avg_volume(ticker: str,
     return sum(volumes) / len(volumes) if volumes else None
 
 
+def get_fx_rate(base: str, quote: str,
+                ttl: float = TTL_PRICE,
+                force_refresh: bool = False) -> Optional[float]:
+    """How many units of `quote` one unit of `base` buys. None if unknown.
+
+    Yahoo carries FX as a synthetic ticker, "USDCAD=X", so this is an ordinary
+    price fetch on the price TTL and the inverse pair is tried when the direct
+    one is not quoted.
+
+    Returning None rather than 1.0 for an unknown pair is deliberate: a caller
+    comparing money across currencies has to be able to tell "converted" from
+    "could not convert", and a silent 1.0 is the failure mode that makes a CAD
+    figure look like a USD one.
+    """
+    base = str(base or "").strip().upper()
+    quote = str(quote or "").strip().upper()
+    if not base or not quote:
+        return None
+    if base == quote:
+        return 1.0
+
+    def _last_close(symbol):
+        rows = get_price_history(symbol, period="5d", ttl=ttl,
+                                 force_refresh=force_refresh) or []
+        for row in reversed(rows):
+            value = _num(row.get("close"))
+            if value and value > 0:
+                return value
+        return None
+
+    direct = _last_close(f"{base}{quote}=X")
+    if direct:
+        return direct
+    inverse = _last_close(f"{quote}{base}=X")
+    if inverse:
+        return 1.0 / inverse
+    _warn(f"no FX rate available for {base}->{quote}")
+    return None
+
+
 def get_company_name(ticker: str, info: Optional[dict] = None) -> Optional[str]:
     """longName, falling back to shortName / displayName. None if unknown."""
     if info is None:

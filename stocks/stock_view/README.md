@@ -66,7 +66,7 @@ what to run, rather than an error.
 
 | View | What it shows |
 |---|---|
-| **Overview** | One row per candidate — composite, rating, liquidity/trend/divergence/conviction flags, sentiment, held marker. Sortable on any column; filter by sector, minimum composite, cluster resolution, and held vs. not held. |
+| **Overview** | One row per candidate — composite, rating, liquidity/trend/divergence/conviction flags, data coverage, sentiment, held marker. Sortable on any column; filter by sector, minimum composite, cluster resolution, held vs. not held, and data coverage. |
 | **Cluster explorer** | The clusters from `clustered.json`, which is richer than the trimmed `cluster` field on each candidate: members, average correlation, dispersion, eigenvalue, share of variance, the resolution and why it resolved that way, plus the winner and its demoted peers. Each cluster gets a correlation heatmap. |
 | **Position sizing simulator** | The core view. Move the correlation threshold, reduction factor, basis (raw/cleaned) and reduction mode (proportional/flat), and every not-yet-held candidate is re-sized live. Select a handful of names for a rollup: combined allocation, sector concentration, and which holdings are taking the most size out of the selection. |
 | **Ticker drill-down** | The full blob behind one name — every metric group, Piotroski, Altman Z, Graham, Magic Formula, the DCF scenarios, the value screen, insider activity, warnings and notes. Plus the optional price sparkline. |
@@ -167,5 +167,26 @@ sv/views/holdings.py     holdings and the exit review
 Scores are coloured on `scan_report.colour()`'s own thresholds — green ≥ 7.5,
 yellow ≥ 5.0, red below — and the flag column uses `flag_cells()`'s vocabulary,
 so a name reads the same here as it does in the terminal report.
+
+## Two columns worth reading carefully
+
+**Trend** is `roa_trend`: the direction multi-year ROA actually went, from the
+share of year-over-year steps that improved plus the overall first-to-last
+change. It replaced `roa_trend_consistent`, which demanded a non-decreasing ROA
+in *every* year and so went red on one soft year in four while staying green for
+a two-year-old listing with a single step to clear — the same business reading
+worse for having reported longer. `·` still means too little history to say, and
+`~ mixed` means the endpoints and the year-to-year steps disagree because one
+spike is doing the work.
+
+**Data** is what share of the ~24 scoring inputs the ticker actually had.
+`stock_evaluator.score()` returns a neutral 5.0 for anything it cannot read,
+which is the right default — it refuses to punish a company for Yahoo's coverage
+of it — but it means a name with almost no data lands near 5.0 and reads as a
+considered HOLD rather than as an absence of information. A 5.4 built from four
+inputs and a 5.4 built from twenty-four are not the same claim. Below 60% the
+evaluator raises a *thin data* risk flag, which costs the name its top
+position-size band, and the drill-down shows the breakdown per dimension next to
+the score each one produced.
 
 ⚠ For informational use only. Not financial advice.

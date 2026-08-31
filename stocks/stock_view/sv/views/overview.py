@@ -42,6 +42,7 @@ def build_frame(candidates, sentiment) -> pd.DataFrame:
             "Role": cluster_role(candidate),
             "Liquidity": d.liquidity_label(candidate),
             "Trend": d.trend_label(candidate),
+            "Data": d.num(candidate.get("data_coverage")),
             "Divergence": d.DIVERGENCE_LABELS.get(
                 candidate.get("divergence_pattern"),
                 candidate.get("divergence_pattern") or "n/a"),
@@ -65,7 +66,7 @@ def render(scan):
     frame = build_frame(candidates, scan.sentiment_scores)
 
     # ── filters ───────────────────────────────────────────────────────────
-    row1 = st.columns([2, 1, 1, 1])
+    row1 = st.columns([2, 1, 1, 1, 1])
     sectors = sorted(s for s in frame["Sector"].dropna().unique())
     chosen_sectors = row1[0].multiselect("Sector", sectors, default=[],
                                          placeholder="All sectors")
@@ -86,6 +87,9 @@ def render(scan):
     resolutions = ["All"] + sorted(frame["Cluster"].unique())
     chosen_resolution = row1[2].selectbox("Cluster resolution", resolutions)
     held_choice = row1[3].selectbox("Holdings", ["All", "Not held", "Held only"])
+    coverage_choice = row1[4].selectbox(
+        "Data coverage", ["All", "Well covered only"],
+        help=d.COVERAGE_HELP)
 
     view = frame.copy()
     if chosen_sectors:
@@ -97,6 +101,10 @@ def render(scan):
         view = view[~view["Held"]]
     elif held_choice == "Held only":
         view = view[view["Held"]]
+    if coverage_choice == "Well covered only":
+        # Names with no coverage recorded are kept: an older scan predates the
+        # field, and absence of the measure is not evidence of thin data.
+        view = view[view["Data"].isna() | (view["Data"] >= d.LOW_COVERAGE)]
 
     view = view.sort_values("Composite", ascending=False, na_position="last")
 
@@ -107,8 +115,10 @@ def render(scan):
 
     styled = (view.style
               .map(d.score_css, subset=["Composite", "Sentiment"])
+              .map(d.coverage_css, subset=["Data"])
               .format({"Composite": lambda v: "n/a" if pd.isna(v) else f"{v:.2f}",
-                       "Sentiment": lambda v: "n/a" if pd.isna(v) else f"{v:.1f}"}))
+                       "Sentiment": lambda v: "n/a" if pd.isna(v) else f"{v:.1f}",
+                       "Data": lambda v: "n/a" if pd.isna(v) else f"{v * 100:.0f}%"}))
 
     st.dataframe(
         styled,
@@ -121,9 +131,9 @@ def render(scan):
             "Sentiment": st.column_config.Column(
                 help="0-10 public sentiment from sentiment.json, centred on 5.0"),
             "Conviction": st.column_config.Column(help=d.CONVICTION_HELP),
-            "Trend": st.column_config.Column(
-                help="Multi-year ROA consistency. '·' means too little history to say, "
-                     "which is not the same as a failed trend."),
+            "Trend": st.column_config.Column(help=d.TREND_HELP),
+            "Data": st.column_config.Column(
+                "Data", help=d.COVERAGE_HELP),
             "Guide": st.column_config.Column(
                 help="The adjusted guide as position_sizer.py wrote it. The sizing "
                      "simulator recomputes this live."),

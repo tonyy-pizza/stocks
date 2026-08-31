@@ -114,7 +114,10 @@ def _frameworks(frameworks):
             st.caption(f"⚠ {magic['warning']}")
 
     dcf = frameworks.get("dcf")
-    if dcf:
+    if dcf and dcf.get("not_applicable"):
+        st.markdown("**DCF scenarios**")
+        st.caption(f"Not applicable — {dcf.get('reason')}")
+    elif dcf:
         st.markdown("**DCF scenarios**")
         rows = []
         for name in ("bear", "base", "bull"):
@@ -187,14 +190,39 @@ def render(scan):
                      help=scores.get("interpretation") or "from sentiment.json")
 
     dims = candidate.get("dims") or {}
+    coverage_detail = ((candidate.get("coverage_detail")
+                        or (scan.scored_record(ticker) or {}).get("coverage_detail")) or {})
+    by_dimension = coverage_detail.get("by_dimension") or {}
+
     if dims:
         st.markdown("**Dimension breakdown**")
         for dim, value in dims.items():
             value = d.num(value)
+            # How much of each dimension was really measured, next to the score
+            # it produced. A 5.0 built from one input of five is the default
+            # showing through, not a verdict, and the two look identical
+            # without this.
+            got = by_dimension.get(dim) or {}
+            inputs = (f" <span style='color:{d.DIM}'>&nbsp;{got['available']}/"
+                      f"{got['total']} inputs</span>") if got else ""
             st.markdown(
                 f"<code>{dim:<14}</code> <code>{d.bar(value, 18)}</code> "
-                f"{d.score_html(value)}",
+                f"{d.score_html(value)}{inputs}",
                 unsafe_allow_html=True)
+
+    overall = d.num(candidate.get("data_coverage")) or d.num(coverage_detail.get("overall"))
+    if overall is not None:
+        available = coverage_detail.get("available")
+        total = coverage_detail.get("total")
+        counted = f" ({available} of {total} inputs)" if available and total else ""
+        if overall < d.LOW_COVERAGE:
+            st.warning(
+                f"**Thin data — {d.coverage_label(overall)} coverage{counted}.** "
+                f"Missing inputs score a neutral 5.0, so this composite is closer "
+                f"to a default than to a reading of the company. "
+                f"stock_evaluator flags it and it loses the top size band.", icon="⚠")
+        else:
+            st.caption(f"Data coverage {d.coverage_label(overall)}{counted}.")
 
     sizing = candidate.get("sizing") or {}
     st.markdown("**Sizing as the pipeline wrote it**")
