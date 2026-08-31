@@ -394,6 +394,11 @@ INDUSTRIES = {
 RND_SECTORS = ("Technology", "Healthcare", "Communication Services", "Industrials")
 
 # ─── v5.5 SCORING CONSTANTS ────────────────────────────────────────────────
+# Bumped whenever this file would score the same company differently - see
+# stocks_common.LOGIC_VERSION_KEY. scan_report re-runs the batch when the
+# stamp on scored_candidates.json does not match this.
+EVALUATOR_VERSION = "5.5"
+
 # Composite is suppressed below this weighted data coverage (mirrors etf.py).
 MIN_COVERAGE = 0.55
 
@@ -2602,7 +2607,7 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
             # rather than as a silently unconverted comparison.
             "fx_rates": {f"{quote}->{account}": rate
                          for (quote, account), rate in sorted(fx_cache.items())},
-            "evaluator_version": "5.5",
+            "evaluator_version": EVALUATOR_VERSION,
             "min_coverage": MIN_COVERAGE,
             "low_coverage": LOW_COVERAGE,
         },
@@ -2610,6 +2615,7 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
         "scored": scored,
         "skipped": skipped,
     }
+    common.stamp_logic_version(document, EVALUATOR_VERSION)
     _write_json(document, output_path)
 
     if not quiet:

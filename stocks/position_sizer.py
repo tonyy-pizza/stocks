@@ -77,6 +77,13 @@ from stock_evaluator import (position_guidance, score_candidate,      # noqa: E4
 # CONFIG
 # -------------------------------------------------------------------------
 
+# Bump when this stage would produce a different answer from the same
+# inputs - scan_report re-runs it when the stamp on its output does not
+# match. See stocks_common.LOGIC_VERSION_KEY.
+# 1.1: the exit thresholds follow stock_evaluator's rating bands, which v5.5
+# rescaled, so the same holding can now fall on the other side of them.
+SIZER_VERSION = "1.1"
+
 DATA_DIR = common.data_dir(md.BASE_DIR)
 HOLDINGS_PATH = DATA_DIR / "holdings.json"
 SCORED_PATH = DATA_DIR / "scored_candidates.json"
@@ -744,6 +751,7 @@ def review_holdings(holdings, scored_records=None, previous=None,
 # -------------------------------------------------------------------------
 
 def write_json(document, output_path):
+    common.stamp_logic_version(document, SIZER_VERSION)
     return common.write_json(document, output_path, default=str)
 
 

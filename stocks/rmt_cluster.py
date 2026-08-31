@@ -81,6 +81,11 @@ import stocks_common as common                              # noqa: E402
 # CONFIG
 # -------------------------------------------------------------------------
 
+# Bump when this stage would produce a different answer from the same
+# inputs - scan_report re-runs it when the stamp on its output does not
+# match. See stocks_common.LOGIC_VERSION_KEY.
+CLUSTER_VERSION = "1.0"
+
 DATA_DIR = common.data_dir(md.BASE_DIR)
 INPUT_PATH = DATA_DIR / "scored_candidates.json"
 OUTPUT_PATH = DATA_DIR / "clustered.json"
@@ -463,6 +468,7 @@ def resolve_cluster(cluster, scores, min_gap=None, min_lead=None):
 # -------------------------------------------------------------------------
 
 def write_json(document, output_path):
+    common.stamp_logic_version(document, CLUSTER_VERSION)
     return common.write_json(document, output_path, default=str)
 
 

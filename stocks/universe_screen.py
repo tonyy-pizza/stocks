@@ -64,6 +64,11 @@ from yfinance import EquityQuery   # query construction only - no network here
 # CONFIG
 # -------------------------------------------------------------------------
 
+# Bump when this stage would produce a different answer from the same
+# inputs - scan_report re-runs it when the stamp on its output does not
+# match. See stocks_common.LOGIC_VERSION_KEY.
+SCREEN_VERSION = "1.0"
+
 # Sits next to market_data.py, so C:\Users\joey\stocks\data\candidates.json.
 DATA_DIR = common.data_dir(md.BASE_DIR)
 OUTPUT_PATH = DATA_DIR / "candidates.json"
@@ -372,6 +377,7 @@ def write_candidates(candidates: list,
         "dropped_duplicates": dropped,
         "candidates": candidates,
     }
+    common.stamp_logic_version(document, SCREEN_VERSION)
     return common.write_json(document, output_path)
 
 

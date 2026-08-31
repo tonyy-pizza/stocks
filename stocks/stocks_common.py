@@ -20,6 +20,8 @@ market_data.py can build on it rather than the other way round.
     num(value)                   float, or None for None/NaN/non-numeric
     read_json(path)              parsed JSON, or None - never raises
     write_json(doc, path)        atomic write (tmp file + replace)
+    stamp_logic_version(doc, v)  record which version of a stage wrote a file
+    output_logic_version(path)   read that back, or None
 
 Deliberately NOT used by stock_view\sv\. That package's contract is that every
 view which only reads JSON works with nothing installed but streamlit, pandas
@@ -113,6 +115,41 @@ def read_json(path) -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
+
+
+# ─── STAGE LOGIC VERSIONS ──────────────────────────────────────────────────
+# scan_report skips a stage whose output is still fresh by TTL. That is a
+# statement about the DATA's age and says nothing about the CODE that produced
+# it, so after a scoring change the pipeline would happily re-render yesterday's
+# numbers under today's timestamp for the rest of the TTL - the failure looks
+# exactly like success. Each stage stamps the version of its own logic into its
+# output; scan_report treats a mismatch as stale, whatever the file's age.
+#
+# Bump a stage's version whenever it would produce a DIFFERENT ANSWER from the
+# same inputs. A refactor that cannot change the output does not need a bump; a
+# threshold change, a new score term, or a changed default does.
+LOGIC_VERSION_KEY = "logic_version"
+
+
+def stamp_logic_version(document: Any, version: str) -> Any:
+    """Record which version of a stage's logic produced this document."""
+    if isinstance(document, dict):
+        document[LOGIC_VERSION_KEY] = str(version)
+    return document
+
+
+def output_logic_version(path) -> Optional[str]:
+    """The logic version stamped in a stage's output, or None.
+
+    None covers both "file is not there" and "file predates versioning", and
+    both mean the same thing to a caller deciding whether to re-run: this
+    output cannot be shown to have come from the code that is on disk now.
+    """
+    document = read_json(path)
+    if not isinstance(document, dict):
+        return None
+    version = document.get(LOGIC_VERSION_KEY)
+    return None if version is None else str(version)
 
 
 def write_json(document: Any,

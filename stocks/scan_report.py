@@ -138,6 +138,11 @@ ARCHIVE_DIR = DATA_DIR / "archive"
 # subreddit requests plus ~5-10 global searches per ticker, against an
 # unauthenticated endpoint that rate-limits. At 25 names that is ~1,375
 # requests in one run. 15 is a more honest default; raise it deliberately.
+# Bump when this stage would produce a different answer from the same
+# inputs - scan_report re-runs it when the stamp on its output does not
+# match. See stocks_common.LOGIC_VERSION_KEY.
+SENTIMENT_VERSION = "1.0"
+
 SENTIMENT_TOP = 15
 
 # Pause between tickers. The per-request sleeps inside ps2.py pace one
@@ -261,7 +266,7 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
         document["skipped"].append({"ticker": None,
                                     "reason": "sentiment evaluator not found "
                                               "(looked for ps2.py / ps.py)"})
-        write_json(document, output_path)
+        write_stage_json(document, output_path, SENTIMENT_VERSION)
         if not quiet:
             print(f"  {Y}sentiment evaluator not found - skipping that stage{X}")
         return document
@@ -358,12 +363,18 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
         "reddit_requests_per_ticker": round(sum(totals) / len(totals), 1) if totals else None,
         "blocked_tickers": document["blocked_count"],
     }
-    write_json(document, output_path)
+    write_stage_json(document, output_path, SENTIMENT_VERSION)
     return document
 
 
 def write_json(document, output_path):
     return common.write_json(document, output_path, default=str)
+
+
+def write_stage_json(document, output_path, version):
+    """write_json, stamped with the logic version that produced it."""
+    common.stamp_logic_version(document, version)
+    return write_json(document, output_path)
 
 
 # ─── PIPELINE ──────────────────────────────────────────────────────────────
@@ -397,13 +408,25 @@ def run_pipeline(args):
     downstream_forced = bool(args.force)
     halted = False
 
-    def stage(name, output, ttl, runner, label, required=True):
-        """Run one stage unless its output is still fresh.
+    def stage(name, output, ttl, runner, label, required=True, version=None):
+        """Run one stage unless its output is still fresh AND current.
 
         `runner` returns an exit code; anything non-zero, an exception, or a
         missing output file afterwards is a failure. A required stage failing
         halts everything after it, since those stages read what this one was
         supposed to write.
+
+        `version` is the stage's current logic version. A TTL answers "is this
+        data old", which is not the question after the code changes: the file
+        can be minutes old and still have been produced by logic that no longer
+        exists. That was a silent failure - the stage reported "fresh - not
+        re-run" and the report re-rendered superseded numbers under today's
+        timestamp for the rest of the TTL. A stamp that does not match the
+        code on disk now counts as stale, whatever the file's age.
+
+        An unstamped file (written before versioning, or by hand) reads as
+        None and also counts as stale. Re-running a stage costs time; showing
+        a number no current code would produce costs more.
         """
         nonlocal downstream_forced, halted
 
@@ -416,15 +439,25 @@ def run_pipeline(args):
             return False
 
         age = file_age_seconds(output)
-        fresh = is_fresh(output, ttl) and not downstream_forced
+        on_disk = common.output_logic_version(output) if version is not None else None
+        outdated = version is not None and age is not None and on_disk != str(version)
+        fresh = is_fresh(output, ttl) and not downstream_forced and not outdated
         if fresh:
             status.append({"stage": name, "action": "skipped (fresh)",
-                           "age": age, "output": str(output), "ok": True})
+                           "age": age, "output": str(output), "ok": True,
+                           "logic_version": on_disk})
             if not args.quiet:
                 print(f"  {G}✓{X} {label:<22} fresh ({describe_age(age)}) - not re-run")
             return False
 
-        reason = "forced" if downstream_forced else ("missing" if age is None else "stale")
+        if downstream_forced:
+            reason = "forced"
+        elif age is None:
+            reason = "missing"
+        elif outdated:
+            reason = (f"logic changed ({on_disk or 'unstamped'} -> {version})")
+        else:
+            reason = "stale"
         if not args.quiet:
             print(f"  {C}→{X} {label:<22} {reason} - running")
 
@@ -465,7 +498,8 @@ def run_pipeline(args):
         downstream_forced = True
         status.append({"stage": name, "action": f"ran ({reason})",
                        "age": file_age_seconds(output), "output": str(output),
-                       "ok": True})
+                       "ok": True,
+                       "logic_version": common.output_logic_version(output)})
         return True
 
     if not args.quiet:
@@ -481,7 +515,8 @@ def run_pipeline(args):
         if args.refresh_prices:
             argv.append("--refresh")
         return universe_screen.main(argv)
-    stage("universe", CANDIDATES, md.TTL_SCREENER, _universe, "universe_screen")
+    stage("universe", CANDIDATES, md.TTL_SCREENER, _universe, "universe_screen",
+          version=universe_screen.SCREEN_VERSION)
 
     # 2. evaluator (batch)
     def _evaluate():
@@ -496,7 +531,8 @@ def run_pipeline(args):
         if args.refresh_prices:
             argv.append("--refresh")
         return stock_evaluator.batch_main(argv)
-    stage("evaluate", SCORED, md.TTL_PRICE, _evaluate, "stock_evaluator")
+    stage("evaluate", SCORED, md.TTL_PRICE, _evaluate, "stock_evaluator",
+          version=stock_evaluator.EVALUATOR_VERSION)
 
     # 3. sentiment over the survivors only
     def _sentiment():
@@ -512,7 +548,7 @@ def run_pipeline(args):
         # *_unverified rather than a crash.
         return 0 if document.get("sentiment") or not tickers else 1
     stage("sentiment", SENTIMENT, md.TTL_PRICE, _sentiment, "sentiment",
-          required=False)
+          required=False, version=SENTIMENT_VERSION)
 
     # 4. correlation clusters
     def _cluster():
@@ -524,7 +560,8 @@ def run_pipeline(args):
         if args.refresh_prices:
             argv.append("--refresh")
         return rmt_cluster.main(argv)
-    stage("cluster", CLUSTERED, md.TTL_PRICE, _cluster, "rmt_cluster")
+    stage("cluster", CLUSTERED, md.TTL_PRICE, _cluster, "rmt_cluster",
+          version=rmt_cluster.CLUSTER_VERSION)
 
     # 5. sizing against holdings
     def _size():
@@ -534,7 +571,8 @@ def run_pipeline(args):
         if args.refresh_prices:
             argv.append("--refresh")
         return position_sizer.main(argv)
-    stage("size", SIZED, md.TTL_PRICE, _size, "position_sizer")
+    stage("size", SIZED, md.TTL_PRICE, _size, "position_sizer",
+          version=position_sizer.SIZER_VERSION)
 
     return status
 
@@ -785,6 +823,22 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
             print(f"  {label:<18} {when}")
         else:
             print(f"  {label:<18} {D}unknown{X}")
+
+    # Which scoring logic produced these numbers. Worth a line because the
+    # scores on screen can outlive the code that made them: a stale
+    # scored_candidates.json used to be re-rendered under a fresh header with
+    # nothing on the page saying so. A mismatch here now cannot survive a run
+    # - stage() re-runs on it - so this line reads as confirmation rather than
+    # as a warning, which is exactly what was missing before.
+    scored_version = (scored_doc or {}).get(common.LOGIC_VERSION_KEY)
+    current = stock_evaluator.EVALUATOR_VERSION
+    if scored_version is None:
+        print(f"  {'Scored by':<18} {Y}unstamped (pre-versioning file){X}")
+    elif str(scored_version) != str(current):
+        print(f"  {'Scored by':<18} {R}evaluator v{scored_version}, "
+              f"but the code here is v{current}{X}")
+    else:
+        print(f"  {'Scored by':<18} {D}evaluator v{scored_version}{X}")
 
     # Counts, including anything that fell out along the way.
     scored_counts = (scored_doc or {}).get("counts") or {}
