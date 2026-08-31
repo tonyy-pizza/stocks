@@ -22,8 +22,11 @@ YELLOW = "#9a6700"
 RED = "#cf222e"
 DIM = "#8b949e"
 
-GOOD = 7.5      # stock_evaluator.colour: >= 7.5 is green and bold
-FAIR = 5.0      # >= 5.0 is yellow, below is red
+# Mirrors stock_evaluator.COLOUR_GOOD / COLOUR_FAIR, which v5.5 tied to the
+# rating bands. Kept as literals here so the viewer has no import-time
+# dependency on the evaluator; update both together.
+GOOD = 6.25     # stock_evaluator.COLOUR_GOOD: at or above this is green
+FAIR = 5.00     # stock_evaluator.COLOUR_FAIR: at or above this is yellow
 
 
 def num(value) -> Optional[float]:

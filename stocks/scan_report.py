@@ -75,11 +75,12 @@ G, Y, R, C, B, D, X = ("\033[92m", "\033[93m", "\033[91m", "\033[96m",
 
 
 def colour(v, t=None):
-    """stock_evaluator.colour, same thresholds."""
+    """stock_evaluator.colour, thresholds taken from it rather than copied."""
     if v is None:
         return f"{D}  n/a{X}"
     t = t if t is not None else f"{v:.2f}"
-    return f"{G}{B}{t}{X}" if v >= 7.5 else f"{Y}{t}{X}" if v >= 5.0 else f"{R}{t}{X}"
+    if v >= stock_evaluator.COLOUR_GOOD: return f"{G}{B}{t}{X}"
+    return f"{Y}{t}{X}" if v >= stock_evaluator.COLOUR_FAIR else f"{R}{t}{X}"
 
 
 def bar(s, w=14):

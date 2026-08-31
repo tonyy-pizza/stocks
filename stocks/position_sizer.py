@@ -68,6 +68,7 @@ _add_script_dir_to_path()
 import market_data as md                                   # noqa: E402
 import rmt_cluster as rc                                    # noqa: E402
 from stock_evaluator import (position_guidance, score_candidate,      # noqa: E402
+                             RATING_BANDS,                            # v5.5 scale
                              G, Y, R, X)                              # same palette
 
 
@@ -128,9 +129,13 @@ CONVICTION_SCALE = {
 # ── Exit review ───────────────────────────────────────────────────────────
 # A holding is re-scored through Stage 1 on every run: the entry pipeline is
 # only half a strategy if nothing ever asks whether the thesis still holds.
-EXIT_COMPOSITE = 4.0         # at or below this, the case for holding is gone
-EXIT_WATCH_COMPOSITE = 5.5   # below this, worth a look
-EXIT_DROP = 1.5              # composite fall since the last archived scan
+# Derived from the evaluator's own rating bands rather than hardcoded, so the
+# exit review keeps meaning the same thing after a scoring recalibration.
+# stock_evaluator v5.5 rescaled the composite (`good` maps to 9.0, not 10.0);
+# fixed thresholds here would have silently become stricter overnight.
+EXIT_COMPOSITE = RATING_BANDS[3]        # at or below this, the case for holding is gone
+EXIT_WATCH_COMPOSITE = RATING_BANDS[2]  # below this, worth a look
+EXIT_DROP = 1.5                         # composite fall since the last archived scan
 
 HOLDINGS_TEMPLATE = {
     "_comment": (
@@ -442,8 +447,10 @@ def size_candidate(ticker, record, cluster, holding, correlations,
     """
     metrics = record.get("metrics") or {}
     scores = {"composite": record.get("composite"),
-              "dims": record.get("dims") or {}}
-    guidance = position_guidance(metrics, scores, record.get("insider"))
+              "dims": record.get("dims") or {},
+              "coverage": record.get("coverage")}
+    guidance = position_guidance(metrics, scores, record.get("insider"),
+                                 record.get("concentration"))
 
     verdict, conviction_detail = conviction_verdict(
         record.get("divergence_pattern"), sentiment_scores)
