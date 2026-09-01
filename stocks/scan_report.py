@@ -3,7 +3,14 @@ r"""
 scan_report.py - run the whole scan and render the Tier 1 summary.
 
     universe_screen  ->  stock_evaluator --batch  ->  sentiment (survivors only)
-                     ->  rmt_cluster  ->  position_sizer  ->  this report
+                     ->  rmt_cluster  ->  position_sizer  ->  entry_timing
+                     ->  holdings_exit  ->  this report
+
+The report has two halves: BUY SIGNALS, the candidate list, each name tagged
+with entry_timing's read on whether its price has actually turned; and SELL /
+REVIEW SIGNALS, the holdings holdings_exit found an exit trigger on. Names
+whose fundamentals cleared but whose price is still falling stay in the buy
+list - they passed - but grouped below the ones timed for entry this week.
 
 Each stage reads the previous stage's file out of C:\Users\joey\stocks\data\.
 A stage is skipped when its output is still fresh by market_data.py's TTL
@@ -24,13 +31,20 @@ when Reddit rate-limits, is reported, and does not halt anything.
 
 Nothing here re-implements a stage. Each is invoked through its own entry
 point (universe_screen.main, stock_evaluator.batch_main, rmt_cluster.main,
-position_sizer.main), and --detail hands off to stock_evaluator's existing
-single-ticker report. Paths, atomic JSON writes and number coercion come from
-stocks_common.py rather than being copied in.
+position_sizer.main, entry_timing.evaluate_timing, holdings_exit.main), and
+--detail hands off to stock_evaluator's existing single-ticker report. Paths,
+atomic JSON writes and number coercion come from stocks_common.py rather than
+being copied in.
+
+The two new stages are optional: neither is an input to anything else, so a
+failure in either is reported and does not halt the scan or change the exit
+code. entry_timing.py in particular may not be on disk at all, which is why it
+is imported tolerantly and its absence reads as "no timing flags this run"
+rather than as a broken pipeline.
 
 Every completed run is snapshotted to data\archive\<timestamp>\, and the
 newest --archive-keep of those are retained (30 by default). A snapshot is a
-full copy of the five JSON files and scored_candidates.json alone runs to tens
+full copy of the run's JSON files and scored_candidates.json alone runs to tens
 of megabytes on a few-thousand-name universe, so without a bound the archive
 becomes the largest thing in the project. Only the most recent run is ever read
 back, by position_sizer's exit review.
@@ -50,6 +64,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -83,6 +98,19 @@ import universe_screen                       # noqa: E402
 import stock_evaluator                       # noqa: E402
 import rmt_cluster                           # noqa: E402
 import position_sizer                        # noqa: E402
+import holdings_exit                         # noqa: E402
+
+# entry_timing.py is the one stage that may not be on disk. Every other import
+# above is a hard dependency - the pipeline cannot run without it - but the
+# timing stage only annotates a candidate list that is already complete, so its
+# absence costs the tags and nothing else. Imported here rather than inside the
+# stage so the failure is named once, at startup, instead of guessed at later.
+try:
+    import entry_timing                      # noqa: E402
+except Exception as exc:                     # noqa: BLE001
+    entry_timing, ENTRY_TIMING_IMPORT_ERROR = None, f"{type(exc).__name__}: {exc}"
+else:
+    ENTRY_TIMING_IMPORT_ERROR = None
 
 
 # ─── DISPLAY ───────────────────────────────────────────────────────────────
@@ -127,6 +155,8 @@ SCORED = DATA_DIR / "scored_candidates.json"
 SENTIMENT = DATA_DIR / "sentiment.json"
 CLUSTERED = DATA_DIR / "clustered.json"
 SIZED = DATA_DIR / "sized_candidates.json"
+TIMING = DATA_DIR / "timing_flags.json"
+EXIT_SIGNALS = DATA_DIR / "exit_signals.json"
 RUN_STATUS = DATA_DIR / "run_status.json"
 ARCHIVE_DIR = DATA_DIR / "archive"
 
@@ -367,6 +397,170 @@ def run_sentiment_stage(tickers, output_path=SENTIMENT, force_refresh=False, qui
     return document
 
 
+# ─── ENTRY TIMING (entry_timing.py, over the buy candidates) ───────────────
+
+def timing_entry_point():
+    """(evaluate_timing, None), or (None, why it cannot be called)."""
+    if entry_timing is None:
+        return None, (ENTRY_TIMING_IMPORT_ERROR
+                      or "entry_timing.py not found next to this script")
+    function = getattr(entry_timing, "evaluate_timing", None)
+    if not callable(function):
+        return None, "entry_timing.py has no evaluate_timing()"
+    return function, None
+
+
+def timing_logic_version():
+    """entry_timing's own logic version, when it publishes one.
+
+    None means the stage is judged on its output's age alone - the same
+    position every stage was in before versioning existed - rather than being
+    re-run every time because a stamp this file invented never matches.
+    """
+    for name in ("TIMING_VERSION", "ENTRY_TIMING_VERSION", "LOGIC_VERSION"):
+        version = getattr(entry_timing, name, None)
+        if version:
+            return str(version)
+    return None
+
+
+def timing_call_kwargs(function, tickers, output_path, force_refresh, quiet):
+    """Offer evaluate_timing everything it might want; drop what it does not take.
+
+    entry_timing.py is developed apart from this file, so its exact signature is
+    not knowable from here. Guessing one and calling it would fail on any other,
+    and a TypeError raised inside the function is indistinguishable from one
+    raised by calling it wrongly. Reading the signature instead is the narrower
+    assumption: the only thing assumed is the function's name.
+    """
+    offered = {
+        "tickers": tickers, "candidates": tickers,
+        "output_path": output_path, "output": output_path,
+        "force_refresh": force_refresh, "refresh": force_refresh,
+        "quiet": quiet,
+    }
+    canonical = ("tickers", "output_path", "force_refresh", "quiet")
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        # **kwargs swallows anything, so send one name per idea rather than
+        # both spellings of it.
+        return {name: offered[name] for name in canonical}
+    return {name: offered[name] for name, p in parameters.items()
+            if name in offered
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+
+
+def run_timing_stage(tickers, output_path=TIMING, force_refresh=False, quiet=False):
+    """entry_timing.evaluate_timing() over this scan's buy candidates.
+
+    Returns an exit code, like every other stage runner here. A module that
+    writes its own output is left to it; one that returns the document instead
+    has it written here, so either convention works.
+
+    Raises when entry_timing.py is not there to be called: stage() records the
+    message against an optional stage, and the report renders untagged and says
+    so. The alternative - writing an empty timing_flags.json - would read as
+    fresh on the next run and quietly suppress the tags for a day.
+    """
+    function, reason = timing_entry_point()
+    if function is None:
+        raise RuntimeError(reason)
+
+    if not quiet:
+        print(f"    entry_timing over {len(tickers)} candidate(s)")
+
+    before = _output_stamp(output_path)
+    result = function(**timing_call_kwargs(function, tickers, output_path,
+                                           force_refresh, quiet))
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict) and _output_stamp(output_path) == before:
+        result.setdefault("generated_at", dt.datetime.now().isoformat(timespec="seconds"))
+        version = timing_logic_version()
+        if version:
+            write_stage_json(result, output_path, version)
+        else:
+            write_json(result, output_path)
+    return 0
+
+
+# The flag values this report knows how to draw. Anything else entry_timing
+# emits still shows, abbreviated, rather than being silently dropped - a flag
+# this file has not been taught about is news, not noise.
+TIMING_REVERSAL = "reversal_signal"
+TIMING_STILL_FALLING = "still_falling"
+
+_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+_FLAG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_NOT_A_TICKER = {"GENERATED_AT", "NOTE", "NOTES", "PARAMS", "COUNTS", "SOURCE",
+                 "VERSION", "LOGIC_VERSION", "INPUTS", "EVALUATED", "TIMING",
+                 "FLAGS", "TIMING_FLAGS", "CANDIDATES"}
+
+
+def _flag_value(value):
+    """The flag out of whatever entry_timing recorded against a ticker."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("timing_flag", "flag", "signal"):
+            flag = value.get(key)
+            if isinstance(flag, str) and flag.strip():
+                return flag.strip()
+    return None
+
+
+def timing_flags(document):
+    """timing_flags.json -> {TICKER: flag}.
+
+    entry_timing.py owns this file and is written separately, so the reader
+    takes the shapes it could reasonably have - a mapping under "timing",
+    "timing_flags" or "flags", a list of records under "evaluated" or
+    "candidates", or a bare ticker mapping - and a value that is either the
+    flag itself or a record carrying one. A name it cannot read has no flag,
+    which is what the report shows for a candidate entry_timing did not cover.
+    """
+    if not isinstance(document, dict):
+        return {}
+
+    flags = {}
+
+    def record(ticker, value):
+        ticker = str(ticker or "").strip().upper()
+        flag = _flag_value(value)
+        if ticker and flag:
+            flags[ticker] = flag
+
+    for key in ("timing", "timing_flags", "flags"):
+        block = document.get(key)
+        if isinstance(block, dict):
+            for ticker, value in block.items():
+                record(ticker, value)
+
+    for key in ("evaluated", "candidates", "timing", "timing_flags", "flags"):
+        block = document.get(key)
+        if isinstance(block, list):
+            for entry in block:
+                if isinstance(entry, dict):
+                    record(entry.get("ticker"), entry)
+
+    if not flags:
+        # A bare {"AAPL": "still_falling"} file. Guarded on both sides -
+        # ticker-shaped key, flag-shaped value - so that "generated_at" and
+        # friends cannot be read as positions.
+        for ticker, value in document.items():
+            key = str(ticker).strip().upper()
+            if key in _NOT_A_TICKER or not _TICKER_RE.match(key):
+                continue
+            if isinstance(value, dict) or (isinstance(value, str)
+                                           and _FLAG_RE.match(value.strip())):
+                record(key, value)
+
+    return flags
+
+
 def write_json(document, output_path):
     return common.write_json(document, output_path, default=str)
 
@@ -574,6 +768,34 @@ def run_pipeline(args):
     stage("size", SIZED, md.TTL_PRICE, _size, "position_sizer",
           version=position_sizer.SIZER_VERSION)
 
+    # 6. entry timing over the names that got through
+    #
+    # Optional, like sentiment and for the same reason: nothing downstream
+    # reads it. A candidate with no timing flag is still a candidate that
+    # cleared the fundamentals, and the report says so rather than hiding it.
+    def _timing():
+        sized = read_json(SIZED) or {}
+        tickers = [c["ticker"] for c in (sized.get("candidates") or [])
+                   if c.get("ticker")]
+        return run_timing_stage(tickers, force_refresh=args.refresh_prices,
+                                quiet=args.quiet)
+    stage("timing", TIMING, md.TTL_PRICE, _timing, "entry_timing",
+          required=False, version=timing_logic_version())
+
+    # 7. exit signals over the holdings
+    #
+    # Reads holdings.json and the archive rather than any file above it, so it
+    # would run even on a scan that found nothing to buy - and should, since
+    # the reason to look at a holding does not depend on this week's
+    # candidates.
+    def _exits():
+        argv = ["--quiet"]
+        if args.refresh_prices:
+            argv.append("--refresh")
+        return holdings_exit.main(argv)
+    stage("exits", EXIT_SIGNALS, md.TTL_PRICE, _exits, "holdings_exit",
+          required=False, version=holdings_exit.EXIT_VERSION)
+
     return status
 
 
@@ -680,7 +902,8 @@ def archive_run(status, keep=DEFAULT_ARCHIVE_KEEP, quiet=False):
     target.mkdir(parents=True, exist_ok=True)
 
     copied = []
-    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED, RUN_STATUS):
+    for path in (CANDIDATES, SCORED, SENTIMENT, CLUSTERED, SIZED, TIMING,
+                 EXIT_SIGNALS, RUN_STATUS):
         if path.exists():
             try:
                 shutil.copy2(path, target / path.name)
@@ -768,15 +991,32 @@ def flag_cells(candidate, sentiment):
     return "  ".join(cells)
 
 
-def candidate_row(candidate, sentiment, indent=2):
+# Six visible characters, fixed, so the flag block after it stays in its
+# column. Short because this report is read in an 80-column console: the words
+# are in the legend, and the still-falling names get their own heading anyway.
+TIMING_CELLS = {
+    TIMING_REVERSAL:      (G, "[rev] "),
+    TIMING_STILL_FALLING: (Y, "[fall]"),
+}
+
+
+def timing_cell(flag):
+    """The timing tag, or a dim placeholder for a name entry_timing missed."""
+    if not flag:
+        return f"{D}  ·   {X}"
+    tint, text = TIMING_CELLS.get(flag, (D, f"[{flag[:4]}]"))
+    return f"{tint}{text:<6}{X}"
+
+
+def candidate_row(candidate, sentiment, indent=2, flag=None):
     composite = _num(candidate.get("composite"))
     pad = " " * indent
     held = f" {C}[held]{X}" if candidate.get("already_held") else ""
     sizing = candidate.get("sizing") or {}
     guide = (sizing.get("adjusted_guide") or "").split(";")[0]
     cut = f" {Y}(cut {sizing['reduction']*100:.0f}%){X}" if sizing.get("correlation_adjusted") else ""
-    print(f"  {pad}{candidate['ticker']:<9} {colour(composite)} {bar(composite)}  "
-          f"{flag_cells(candidate, sentiment)}{held}")
+    print(f"  {pad}{candidate['ticker']:<9} {colour(composite)} {bar(composite)} "
+          f"{timing_cell(flag)} {flag_cells(candidate, sentiment)}{held}")
     if guide:
         print(f"  {pad}{'':<9} {D}{guide}{X}{cut}")
 
@@ -802,10 +1042,201 @@ def sector_etf_line(members, candidates_by_ticker):
             f"not the name. Sector ETF: {B}{etf}{X}")
 
 
-def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, args):
+def render_candidate_groups(candidates, sentiment, flags, by_ticker):
+    """The candidate list as it has always been drawn: clusters, then singles.
+
+    Lifted out of render_report so the buy section can draw it twice, once for
+    the names timed for entry and once for the ones still falling. One thing
+    changed on the way out: a cluster can now arrive part-shown, because the
+    timing split does not respect cluster membership, so the count is stated
+    and a pick_winner cluster missing its winner is drawn flat.
+    """
+    # Group by cluster; demoted peers nest under their winner.
+    clusters, standalone = {}, []
+    for candidate in candidates:
+        cluster = candidate.get("cluster")
+        if cluster:
+            clusters.setdefault(cluster["cluster_index"], []).append(candidate)
+        else:
+            standalone.append(candidate)
+
+    ordered = sorted(clusters.items(),
+                     key=lambda kv: -max((_num(c.get("composite")) or 0) for c in kv[1]))
+
+    if ordered:
+        print()
+        h("CORRELATION CLUSTERS")
+        rule("─")
+
+    for index, members in ordered:
+        info = members[0]["cluster"]
+        resolution = info.get("resolution")
+        corr = info.get("avg_correlation")
+        tag = f"{Y}pick_winner{X}" if resolution == "pick_winner" else f"{C}industry_wide{X}"
+        print()
+        print(f"  {tag}  {len(info.get('members') or members)} names  ·  "
+              f"avg corr {corr:.2f}" if corr is not None else f"  {tag}")
+
+        members.sort(key=lambda c: -(_num(c.get("composite")) or 0))
+        winner_ticker = info.get("winner")
+        winner = next((c for c in members if c["ticker"] == winner_ticker), None)
+        if resolution == "pick_winner" and winner is not None:
+            candidate_row(winner, sentiment, indent=2, flag=flags.get(winner["ticker"]))
+            peers = [c for c in members if c["ticker"] != winner["ticker"]]
+            if peers:
+                print(f"    {D}demoted peers{X}")
+                for peer in peers:
+                    candidate_row(peer, sentiment, indent=6,
+                                  flag=flags.get(peer["ticker"]))
+            continue
+
+        # Splitting the candidates by timing can leave a cluster part-shown.
+        # Saying so beats a header that reads "3 names" over two rows - and for
+        # a pick_winner cluster whose winner is in the other group, beats
+        # promoting the best of what is left and calling it the winner, which
+        # is what filtering a cluster does silently.
+        total = len(info.get("members") or members)
+        if len(members) < total:
+            note = (f"{len(members)} of {total} members here - the rest are in "
+                    f"the other timing group")
+            if resolution == "pick_winner" and winner is None and winner_ticker:
+                note += f", the winner {winner_ticker} among them"
+            print(f"    {D}{note}{X}")
+        for member in members:
+            candidate_row(member, sentiment, indent=2, flag=flags.get(member["ticker"]))
+        if resolution != "pick_winner":
+            line = sector_etf_line([c["ticker"] for c in members], by_ticker)
+            if line:
+                print(f"    {D}→{X} {line}")
+
+    if standalone:
+        print()
+        h("STANDALONE")
+        rule("─")
+        standalone.sort(key=lambda c: -(_num(c.get("composite")) or 0))
+        for candidate in standalone:
+            candidate_row(candidate, sentiment, indent=2,
+                          flag=flags.get(candidate["ticker"]))
+
+
+def render_buy_signals(candidates, sentiment, flags, by_ticker):
+    """BUY SIGNALS, split by whether the price has actually turned yet.
+
+    A still_falling name passed the same fundamentals as everything above it
+    and stays in the list for that reason. It sits below because the question
+    this section answers is what to buy THIS WEEK, and a business worth owning
+    whose price is still falling is a worse answer to that question than the
+    same business after it stops - without being a worse business.
+    """
+    print()
+    h("BUY SIGNALS — candidates that cleared the fundamentals")
+    rule("─")
+
+    falling_tickers = {c["ticker"] for c in candidates
+                       if flags.get(c["ticker"]) == TIMING_STILL_FALLING}
+    falling = [c for c in candidates if c["ticker"] in falling_tickers]
+    timed = [c for c in candidates if c["ticker"] not in falling_tickers]
+
+    if timed:
+        render_candidate_groups(timed, sentiment, flags, by_ticker)
+    else:
+        print(f"  {Y}every candidate is still falling - none timed for entry "
+              f"this week{X}")
+
+    if falling:
+        print()
+        print(f"  {D}── still falling — fundamentals cleared, the price has not "
+              f"turned yet ──{X}")
+        falling.sort(key=lambda c: -(_num(c.get("composite")) or 0))
+        for candidate in falling:
+            candidate_row(candidate, sentiment, indent=2,
+                          flag=flags.get(candidate["ticker"]))
+
+
+# Red is act on it, yellow is look at it, green is the discount closed - the
+# same convention the rest of the report uses. thesis_completed is green
+# because it is the exit the thesis was written for, not a failure.
+EXIT_TINTS = {"thesis_broken": R, "stop_loss": R, "reassess": Y,
+              "thesis_completed": G}
+# Most urgent first, both for the row order and within a row's trigger list.
+EXIT_RANK = {"thesis_broken": 0, "stop_loss": 1, "thesis_completed": 2,
+             "reassess": 3}
+
+
+def _clip(text, width=70):
+    text = str(text or "")
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def render_exit_signals(exit_doc):
+    """SELL / REVIEW SIGNALS - only the holdings with something to act on.
+
+    A holding with no trigger is not listed. It was still evaluated, and the
+    count of those says so, but a review section that lists everything is a
+    list nobody reads twice.
+    """
+    if not isinstance(exit_doc, dict):
+        return
+    evaluated = exit_doc.get("evaluated") or []
+    if not evaluated:
+        return
+
+    flagged = [row for row in evaluated if row.get("triggers")]
+    unavailable = [row for row in evaluated if row.get("status") == "unavailable"]
+    clean = len(evaluated) - len(flagged) - len(unavailable)
+
+    print()
+    h("SELL / REVIEW SIGNALS — holdings with an exit trigger")
+    rule("─")
+
+    if not flagged:
+        # `clean` rather than len(evaluated): a holding that could not be
+        # re-scored was not reviewed, and the trailer below names those.
+        print(f"    {G}nothing to act on{X}  {D}· {clean} holding(s) reviewed, "
+              f"no triggers{X}")
+
+    def severity(row):
+        return min((EXIT_RANK.get(t, 9) for t in row["triggers"]), default=9)
+
+    for row in sorted(flagged, key=lambda r: (severity(r), r["ticker"])):
+        triggers = sorted(row["triggers"], key=lambda t: EXIT_RANK.get(t, 9))
+        tint = EXIT_TINTS.get(triggers[0], Y)
+        labels = "  ".join(f"{EXIT_TINTS.get(t, Y)}{t}{X}" for t in triggers)
+
+        pct = _num(row.get("pct_change_from_entry"))
+        days = row.get("days_held")
+        numbers = [f"{pct:+.1f}% since entry" if pct is not None
+                   else "no entry price on file",
+                   f"held {days}d" if days is not None else "no entry date on file"]
+        summary = row.get("current_metrics_summary") or {}
+        composite = _num(summary.get("composite"))
+        if composite is not None:
+            numbers.append(f"composite {composite:.2f}")
+
+        print(f"    {tint}{row['ticker']:<9}{X} {labels}")
+        print(f"    {'':<9} {D}{' · '.join(numbers)}{X}")
+        reasons = row.get("trigger_reasons") or {}
+        for trigger in triggers:
+            for reason in (reasons.get(trigger) or [])[:1]:
+                print(f"    {'':<9} {D}{trigger}: {_clip(reason)}{X}")
+
+    trail = []
+    if flagged and clean > 0:
+        trail.append(f"{clean} other holding(s) reviewed, no triggers")
+    if unavailable:
+        names = ", ".join(row["ticker"] for row in unavailable[:6])
+        more = "" if len(unavailable) <= 6 else f" +{len(unavailable) - 6} more"
+        trail.append(f"{len(unavailable)} could not be re-scored: {names}{more}")
+    if trail:
+        print(f"    {D}{' · '.join(trail)}{X}")
+
+
+def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, args,
+                  timing_doc=None, exit_doc=None):
     candidates = sized_doc.get("candidates") or []
     by_ticker = {c["ticker"]: c for c in candidates}
     sentiment = (sentiment_doc or {}).get("sentiment") or {}
+    flags = timing_flags(timing_doc)
 
     print()
     rule()
@@ -847,6 +1278,17 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
     print(f"  {'Candidates':<18} {len(candidates)} shown  ·  "
           f"{scored_counts.get('scored', '?')} scored of "
           f"{scored_counts.get('candidates', '?')} screened")
+    if flags:
+        reversal = sum(1 for c in candidates
+                       if flags.get(c["ticker"]) == TIMING_REVERSAL)
+        falling = sum(1 for c in candidates
+                      if flags.get(c["ticker"]) == TIMING_STILL_FALLING)
+        print(f"  {'Entry timing':<18} {D}{reversal} reversal signal  ·  "
+              f"{falling} still falling  ·  "
+              f"{len(candidates) - reversal - falling} unflagged{X}")
+    else:
+        print(f"  {'Entry timing':<18} {Y}no timing flags on file - candidates "
+              f"are untagged{X}")
     if skipped or sent_skipped:
         parts = []
         if skipped:
@@ -875,12 +1317,19 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
         print(f"  {Y}No candidates cleared the bar this scan — this can be a "
               f"legitimate market{X}")
         print(f"  {Y}condition, not an error.{X}")
+        # The holdings still get their section. Nothing about whether to sell
+        # what you own depends on this week's buy list being non-empty, and a
+        # scan that found nothing to buy is exactly when that gets forgotten.
+        render_exit_signals(exit_doc)
         print()
         rule("─")
         print(f"  {Y}{DISCLAIMER}{X}")
         rule()
         print()
         return
+
+    render_buy_signals(candidates, sentiment, flags, by_ticker)
+    render_exit_signals(exit_doc)
 
     reviews = sized_doc.get("holdings_review") or []
     if reviews:
@@ -897,57 +1346,6 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
                   f"{tint}{review['verdict']}{X}{shift}")
             print(f"    {'':<9} {D}{review['reasons'][0]}{X}")
 
-    # Group by cluster; demoted peers nest under their winner.
-    clusters, standalone = {}, []
-    for candidate in candidates:
-        cluster = candidate.get("cluster")
-        if cluster:
-            clusters.setdefault(cluster["cluster_index"], []).append(candidate)
-        else:
-            standalone.append(candidate)
-
-    ordered = sorted(clusters.items(),
-                     key=lambda kv: -max((_num(c.get("composite")) or 0) for c in kv[1]))
-
-    if ordered:
-        print()
-        h("CORRELATION CLUSTERS")
-        rule("─")
-
-    for index, members in ordered:
-        info = members[0]["cluster"]
-        resolution = info.get("resolution")
-        corr = info.get("avg_correlation")
-        tag = f"{Y}pick_winner{X}" if resolution == "pick_winner" else f"{C}industry_wide{X}"
-        print()
-        print(f"  {tag}  {len(info.get('members') or members)} names  ·  "
-              f"avg corr {corr:.2f}" if corr is not None else f"  {tag}")
-
-        members.sort(key=lambda c: -(_num(c.get("composite")) or 0))
-        if resolution == "pick_winner":
-            winner_ticker = info.get("winner")
-            winner = next((c for c in members if c["ticker"] == winner_ticker), members[0])
-            candidate_row(winner, sentiment, indent=2)
-            peers = [c for c in members if c["ticker"] != winner["ticker"]]
-            if peers:
-                print(f"    {D}demoted peers{X}")
-                for peer in peers:
-                    candidate_row(peer, sentiment, indent=6)
-        else:
-            for member in members:
-                candidate_row(member, sentiment, indent=2)
-            line = sector_etf_line([c["ticker"] for c in members], by_ticker)
-            if line:
-                print(f"    {D}→{X} {line}")
-
-    if standalone:
-        print()
-        h("STANDALONE")
-        rule("─")
-        standalone.sort(key=lambda c: -(_num(c.get("composite")) or 0))
-        for candidate in standalone:
-            candidate_row(candidate, sentiment, indent=2)
-
     print()
     rule("─")
     h("LEGEND")
@@ -957,6 +1355,10 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
           f"{Y}disconnect?{X} sentiment contests it · {G}disconnect·{X} no sentiment")
     print(f"  {R}value-trap!{X} trend and sentiment both negative · {R}trap-hype{X} "
           f"trend down but sentiment high · sent = 0-10 sentiment")
+    print(f"  {G}[rev]{X} reversal signal, timed for entry · {Y}[fall]{X} still "
+          f"falling, fundamentals cleared but the price has not · {D}·{X} no flag")
+    print(f"  exits: {R}thesis_broken{X}/{R}stop_loss{X} act · {Y}reassess{X} look "
+          f"· {G}thesis_completed{X} the discount closed - the exit it was for")
     if args.show_stages and status:
         print()
         h("STAGES")
@@ -1041,7 +1443,8 @@ def main(argv=None):
         return 2
 
     render_report(sized_doc, read_json(SCORED), read_json(SENTIMENT),
-                  read_json(CLUSTERED), status, args)
+                  read_json(CLUSTERED), status, args,
+                  timing_doc=read_json(TIMING), exit_doc=read_json(EXIT_SIGNALS))
 
     # A halted run still renders - what is on disk is the last good scan and is
     # worth reading - but it says which stage stopped it, and exits non-zero
