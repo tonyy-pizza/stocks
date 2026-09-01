@@ -71,6 +71,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -424,7 +425,8 @@ def timing_logic_version():
     return None
 
 
-def timing_call_kwargs(function, tickers, output_path, force_refresh, quiet):
+def timing_call_kwargs(function, tickers, output_path, force_refresh, quiet,
+                       candidates_path=None):
     """Offer evaluate_timing everything it might want; drop what it does not take.
 
     entry_timing.py is developed apart from this file, so its exact signature is
@@ -432,9 +434,14 @@ def timing_call_kwargs(function, tickers, output_path, force_refresh, quiet):
     and a TypeError raised inside the function is indistinguishable from one
     raised by calling it wrongly. Reading the signature instead is the narrower
     assumption: the only thing assumed is the function's name.
+
+    The shipped entry_timing takes its names from a candidates FILE rather than
+    a list, so the buy list is offered both ways.
     """
     offered = {
         "tickers": tickers, "candidates": tickers,
+        "candidates_path": candidates_path, "candidates_file": candidates_path,
+        "scored_path": candidates_path,
         "output_path": output_path, "output": output_path,
         "force_refresh": force_refresh, "refresh": force_refresh,
         "quiet": quiet,
@@ -449,8 +456,25 @@ def timing_call_kwargs(function, tickers, output_path, force_refresh, quiet):
         # both spellings of it.
         return {name: offered[name] for name in canonical}
     return {name: offered[name] for name, p in parameters.items()
-            if name in offered
+            if name in offered and offered[name] is not None
             and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+
+
+def _write_timing_candidates(tickers, directory):
+    """The buy list as a candidates file, in scored_candidates.json's shape.
+
+    evaluate_timing() reads its names from a file, not an argument, and its
+    default is scored_candidates.json - every name the evaluator scored, which
+    on a real universe is hundreds of tickers and six months of daily history
+    for each. The stage exists to tag the handful that got through sizing, so
+    it is handed exactly those. Written next to the data directory and removed
+    afterwards: it is an argument, not an output.
+    """
+    fd, path = tempfile.mkstemp(dir=str(directory), prefix="timing_candidates_",
+                                suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"scored": [{"ticker": ticker} for ticker in tickers]}, f)
+    return Path(path)
 
 
 def run_timing_stage(tickers, output_path=TIMING, force_refresh=False, quiet=False):
@@ -472,9 +496,19 @@ def run_timing_stage(tickers, output_path=TIMING, force_refresh=False, quiet=Fal
     if not quiet:
         print(f"    entry_timing over {len(tickers)} candidate(s)")
 
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates_path = _write_timing_candidates(tickers, output_path.parent)
     before = _output_stamp(output_path)
-    result = function(**timing_call_kwargs(function, tickers, output_path,
-                                           force_refresh, quiet))
+    try:
+        result = function(**timing_call_kwargs(function, tickers, output_path,
+                                               force_refresh, quiet,
+                                               candidates_path=candidates_path))
+    finally:
+        try:
+            candidates_path.unlink()
+        except OSError:
+            pass
     if isinstance(result, int):
         return result
     if isinstance(result, dict) and _output_stamp(output_path) == before:
@@ -487,11 +521,14 @@ def run_timing_stage(tickers, output_path=TIMING, force_refresh=False, quiet=Fal
     return 0
 
 
-# The flag values this report knows how to draw. Anything else entry_timing
-# emits still shows, abbreviated, rather than being silently dropped - a flag
-# this file has not been taught about is news, not noise.
+# entry_timing's vocabulary. Anything outside it still shows, abbreviated,
+# rather than being silently dropped - a flag this file has not been taught
+# about is news, not noise.
 TIMING_REVERSAL = "reversal_signal"
 TIMING_STILL_FALLING = "still_falling"
+TIMING_OVERBOUGHT = "overbought"
+TIMING_NEUTRAL = "neutral"
+TIMING_NO_HISTORY = "insufficient_history"
 
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 _FLAG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -997,6 +1034,11 @@ def flag_cells(candidate, sentiment):
 TIMING_CELLS = {
     TIMING_REVERSAL:      (G, "[rev] "),
     TIMING_STILL_FALLING: (Y, "[fall]"),
+    # Overbought does not disqualify a cheap name - entry_timing surfaces it
+    # rather than acting on it - so it is a caution, not a rejection.
+    TIMING_OVERBOUGHT:    (Y, "[hot] "),
+    TIMING_NEUTRAL:       (D, "[--]  "),
+    TIMING_NO_HISTORY:    (D, "[hist]"),
 }
 
 
@@ -1285,7 +1327,7 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
                       if flags.get(c["ticker"]) == TIMING_STILL_FALLING)
         print(f"  {'Entry timing':<18} {D}{reversal} reversal signal  ·  "
               f"{falling} still falling  ·  "
-              f"{len(candidates) - reversal - falling} unflagged{X}")
+              f"{len(candidates) - reversal - falling} neutral or unread{X}")
     else:
         print(f"  {'Entry timing':<18} {Y}no timing flags on file - candidates "
               f"are untagged{X}")
@@ -1355,8 +1397,11 @@ def render_report(sized_doc, scored_doc, sentiment_doc, cluster_doc, status, arg
           f"{Y}disconnect?{X} sentiment contests it · {G}disconnect·{X} no sentiment")
     print(f"  {R}value-trap!{X} trend and sentiment both negative · {R}trap-hype{X} "
           f"trend down but sentiment high · sent = 0-10 sentiment")
-    print(f"  {G}[rev]{X} reversal signal, timed for entry · {Y}[fall]{X} still "
-          f"falling, fundamentals cleared but the price has not · {D}·{X} no flag")
+    print(f"  {G}[rev]{X} RSI turning up off an oversold reading, or a MACD cross "
+          f"in the last 3 sessions · {Y}[fall]{X} RSI under 35 and still falling")
+    print(f"  {Y}[hot]{X} RSI over 70 - surfaced, not a rejection · {D}[--]{X} no "
+          f"timing signal either way · {D}[hist]{X} too little price history · "
+          f"{D}·{X} not evaluated")
     print(f"  exits: {R}thesis_broken{X}/{R}stop_loss{X} act · {Y}reassess{X} look "
           f"· {G}thesis_completed{X} the discount closed - the exit it was for")
     if args.show_stages and status:

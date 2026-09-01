@@ -201,15 +201,19 @@ def _write_paper_holdings_adapter(portfolio: dict[str, Any]) -> list[dict[str, A
         "_comment": "Generated from paper_portfolio.json; never the manual holdings file.",
         "holdings": holdings,
     }, PAPER_HOLDINGS_ADAPTER_PATH)
-    # position_sizer.load_holdings() deliberately narrows each row to these
-    # four fields. Return the same normalized view so a fresh paper sizing file
-    # can be recognized and does not get needlessly rebuilt.
+    # position_sizer.load_holdings() narrows each row to a fixed set of fields.
+    # Return the same normalized view so a fresh paper sizing file is
+    # recognized and does not get needlessly rebuilt - which is what happened
+    # when entry_date and entry_price joined the schema and this view did not.
+    # shares comes back through float(), so it is floated here too.
     return [
         {
             "ticker": holding["ticker"],
-            "shares": holding["shares"],
+            "shares": float(holding["shares"]),
             "cost_basis": holding["cost_basis"],
             "currency": holding["currency"],
+            "entry_date": holding["entry_date"],
+            "entry_price": holding["entry_price"],
         }
         for holding in holdings
     ]
@@ -217,21 +221,39 @@ def _write_paper_holdings_adapter(portfolio: dict[str, Any]) -> list[dict[str, A
 
 @contextmanager
 def _paper_sizing_paths():
-    """Redirect scan_report's sizing stage away from manual-track files."""
+    """Redirect scan_report's holdings-aware stages away from manual-track files.
+
+    scan_report.run_pipeline() now ends with an exit stage that reads
+    holdings.json and writes exit_signals.json through holdings_exit. Left
+    alone it would read the real portfolio and overwrite the real exit signals
+    on every paper cycle, which is exactly the isolation this module promises
+    not to break - so those two paths move to the paper track for the duration
+    of the run, alongside sizing.
+    """
+    holdings_exit = importlib.import_module("holdings_exit")
     originals = {
         "scan_sized": scan_report.SIZED,
+        "scan_exits": scan_report.EXIT_SIGNALS,
         "sizer_holdings": position_sizer.HOLDINGS_PATH,
         "sizer_output": position_sizer.OUTPUT_PATH,
+        "exit_holdings": holdings_exit.HOLDINGS_PATH,
+        "exit_output": holdings_exit.OUTPUT_PATH,
     }
     scan_report.SIZED = PAPER_SIZED_PATH
+    scan_report.EXIT_SIGNALS = PAPER_EXIT_SIGNALS_PATH
     position_sizer.HOLDINGS_PATH = PAPER_HOLDINGS_ADAPTER_PATH
     position_sizer.OUTPUT_PATH = PAPER_SIZED_PATH
+    holdings_exit.HOLDINGS_PATH = PAPER_HOLDINGS_ADAPTER_PATH
+    holdings_exit.OUTPUT_PATH = PAPER_EXIT_SIGNALS_PATH
     try:
         yield
     finally:
         scan_report.SIZED = originals["scan_sized"]
+        scan_report.EXIT_SIGNALS = originals["scan_exits"]
         position_sizer.HOLDINGS_PATH = originals["sizer_holdings"]
         position_sizer.OUTPUT_PATH = originals["sizer_output"]
+        holdings_exit.HOLDINGS_PATH = originals["exit_holdings"]
+        holdings_exit.OUTPUT_PATH = originals["exit_output"]
 
 
 def _pipeline_args(*, current_equity: float, force: bool, refresh_prices: bool,
@@ -490,7 +512,11 @@ def _normalize_exit_results(result: Any) -> list[dict[str, Any]]:
     if isinstance(result, tuple):
         result = result[0] if result else None
     if isinstance(result, dict):
-        for key in ("triggers", "exits", "actions", "reviews", "results"):
+        # "evaluated" is the envelope holdings_exit actually writes. Without it
+        # the fallback below walked the document's own metadata keys and read
+        # generated_at, counts and evaluated as if they were tickers, so no
+        # real ticker ever produced a signal and nothing was ever sold.
+        for key in ("evaluated", "triggers", "exits", "actions", "reviews", "results"):
             if isinstance(result.get(key), list):
                 result = result[key]
                 break
@@ -535,13 +561,19 @@ def _normalize_exit_results(result: Any) -> list[dict[str, Any]]:
         reason = item.get("reason") or item.get("detail") or item.get("message")
         if reason is None and isinstance(item.get("reasons"), list):
             reason = "; ".join(str(value) for value in item["reasons"])
+        # holdings_exit records its reasons per trigger rather than per row.
+        per_trigger = item.get("trigger_reasons")
+        per_trigger = per_trigger if isinstance(per_trigger, dict) else {}
         for trigger in trigger_values:
             trigger_name = _normalize_trigger_name(trigger)
             if ticker and trigger_name:
+                specific = per_trigger.get(trigger_name) or per_trigger.get(trigger)
+                if isinstance(specific, (list, tuple)):
+                    specific = "; ".join(str(value) for value in specific)
                 normalized.append({
                     "ticker": ticker,
                     "trigger": trigger_name,
-                    "reason": str(reason or trigger_name),
+                    "reason": str(specific or reason or trigger_name),
                 })
     return normalized
 
