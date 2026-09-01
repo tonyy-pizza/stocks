@@ -155,11 +155,15 @@ HOLDINGS_TEMPLATE = {
         "out and it is inferred from the scan, or from a .TO/.V/.CN/.NE suffix; "
         "set it when you want to be certain, since cost-basis totals are grouped "
         "by currency and never summed across them. "
+        "entry_date: YYYY-MM-DD, the day the position was opened - optional, but "
+        "holdings_exit.py needs it for the stop-loss and reassess checks. "
+        "entry_price: what you paid per share that day - optional, and not the "
+        "same number as cost_basis once a position has been added to. "
         "Delete the example entry below - entries marked _example are ignored."
     ),
     "holdings": [
-        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00,
-         "currency": "USD", "_example": True}
+        {"ticker": "AAPL", "shares": 10, "cost_basis": 150.00, "currency": "USD",
+         "entry_date": "2025-01-15", "entry_price": 148.20, "_example": True}
     ],
 }
 
@@ -173,19 +177,45 @@ _PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 _num = common.num
 
 
+def _entry_date(value) -> Optional[str]:
+    """Normalise an entry_date to "YYYY-MM-DD". Anything else -> None.
+
+    entry_date arrived after the first holdings.json files were written, so a
+    missing or unparseable date is unknown rather than an error: the checks
+    that need it skip that position and say so.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return None
+
+
 # -------------------------------------------------------------------------
 # HOLDINGS
 # -------------------------------------------------------------------------
 
-def load_holdings(holdings_path=None, quiet=False):
+def load_holdings(holdings_path=None, quiet=False, create_template=True):
     """Read holdings.json, writing the template if it does not exist yet.
 
     Returns (holdings list, created_template flag). Entries marked _example are
     skipped, so an untouched template counts as no holdings rather than
     silently pretending you own the example.
+
+    entry_date and entry_price are optional: an entry written before they
+    existed reads back with both as None, which every consumer has to treat as
+    unknown rather than assuming a date or a price.
+
+    create_template=False is for readers that only report on the file
+    (holdings_exit.py) and should not bring it into being as a side effect.
     """
     holdings_path = Path(holdings_path) if holdings_path else HOLDINGS_PATH
     created = False
+
+    if not holdings_path.exists() and not create_template:
+        return [], False
 
     if not holdings_path.exists():
         holdings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,6 +252,8 @@ def load_holdings(holdings_path=None, quiet=False):
             "shares": _num(entry.get("shares")),
             "cost_basis": _num(entry.get("cost_basis")),
             "currency": currency,
+            "entry_date": _entry_date(entry.get("entry_date")),
+            "entry_price": _num(entry.get("entry_price")),
         })
     return holdings, created
 
@@ -668,7 +700,9 @@ def review_holdings(holdings, scored_records=None, previous=None,
             reviews.append({"ticker": ticker, "verdict": "unavailable",
                             "reason": reason or "could not be re-scored",
                             "composite": None, "shares": holding.get("shares"),
-                            "cost_basis": holding.get("cost_basis")})
+                            "cost_basis": holding.get("cost_basis"),
+                            "entry_date": holding.get("entry_date"),
+                            "entry_price": holding.get("entry_price")})
             if not quiet:
                 print(f"    {ticker:<8} {Y}unavailable{X} - {reason}")
             continue
@@ -724,6 +758,8 @@ def review_holdings(holdings, scored_records=None, previous=None,
             "ticker": ticker,
             "shares": holding.get("shares"),
             "cost_basis": holding.get("cost_basis"),
+            "entry_date": holding.get("entry_date"),
+            "entry_price": holding.get("entry_price"),
             "composite": composite,
             "previous_composite": prior,
             "composite_delta": delta,
