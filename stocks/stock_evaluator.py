@@ -1818,6 +1818,15 @@ except Exception as _md_err:      # single-ticker mode must not care
 else:
     _MD_IMPORT_ERROR = None
 
+def account_currency_default() -> str:
+    """What the account settles in, or USD when stocks_common is not importable.
+
+    The single-ticker path deliberately runs with no pipeline modules at all,
+    and reading a default must not be the thing that breaks it.
+    """
+    return common.account_currency() if common is not None else "USD"
+
+
 # Liquidity gate defaults: a 3% position that eats more than 1% of a day's
 # dollar volume is worth flagging, not excluding.
 DEFAULT_POSITION_PCT = 0.03
@@ -2483,7 +2492,7 @@ def _write_json(document, output_path):
 
 def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                       position_pct=DEFAULT_POSITION_PCT, max_adv_pct=DEFAULT_MAX_ADV_PCT,
-                      account_currency="USD", limit=None, sectors=None,
+                      account_currency=None, limit=None, sectors=None,
                       include_insider=False, force_refresh=False, quiet=False,
                       workers=DEFAULT_WORKERS):
     """Score every candidate from Stage 0 into data\\scored_candidates.json.
@@ -2508,6 +2517,11 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
     """
     _require_market_data()
 
+    # None means "whatever the account settles in" - CAD for a Canadian
+    # account, which is what the liquidity gate converts each name's dollar
+    # volume into before comparing it to the position size.
+    account_currency = account_currency or account_currency_default()
+
     candidates_path = Path(candidates_path) if candidates_path else data_dir() / "candidates.json"
     output_path = Path(output_path) if output_path else data_dir() / "scored_candidates.json"
 
@@ -2520,6 +2534,10 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
         candidates = [c for c in candidates if (c.get("sector") or "").lower() in wanted]
     if limit:
         candidates = candidates[:limit]
+
+    # Stage 0's row for each ticker, for the fields only it carries - the
+    # listings this one was kept over, when the run had a listing preference.
+    by_ticker = {str(c.get("ticker") or "").strip().upper(): c for c in candidates}
 
     scored, skipped = [], []
     total = len(candidates)
@@ -2569,7 +2587,18 @@ def evaluate_universe(candidates_path=None, output_path=None, account_size=None,
                 continue
 
             if record is None:
-                skipped.append({"ticker": ticker, "reason": reason})
+                # A name kept over its other listings and then skipped takes
+                # the whole company out of the scan, so the record says which
+                # listing would have been scoreable instead.
+                alternates = (by_ticker.get(ticker) or {}).get("alternates")
+                entry = {"ticker": ticker, "reason": reason}
+                if alternates:
+                    entry["alternates"] = alternates
+                    entry["reason"] = (f"{reason}; kept over "
+                                       f"{', '.join(alternates)} - re-run with "
+                                       f"--prefer-listing volume to score those "
+                                       f"instead")
+                skipped.append(entry)
                 if not quiet:
                     print(f"  [{i:>4}/{total}] {ticker:<10} {Y}skipped{X} - {reason}")
                 continue
@@ -2656,8 +2685,10 @@ def batch_main(argv):
                         help="output file (default: <stocks>/data/scored_candidates.json)")
     parser.add_argument("--account-size", type=float, metavar="AMOUNT",
                         help="account size for the liquidity gate; omitted = gate off")
-    parser.add_argument("--account-currency", default="USD",
-                        help="currency the account size is in (default USD)")
+    parser.add_argument("--account-currency", default=account_currency_default(),
+                        metavar="CODE",
+                        help="currency the account size is in (default "
+                             "$STOCKS_ACCOUNT_CURRENCY, else USD)")
     parser.add_argument("--position-pct", type=float, default=DEFAULT_POSITION_PCT,
                         metavar="FRACTION",
                         help=f"hypothetical position as a fraction of the account "

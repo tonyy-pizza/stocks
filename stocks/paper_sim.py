@@ -47,7 +47,11 @@ DEFAULT_STARTING_CASH = 100_000.0
 DEFAULT_SLIPPAGE = 0.001
 DEFAULT_MAX_POSITION_PCT = 0.10
 DEFAULT_MAX_NEW_BUYS = 5
-ACCOUNT_CURRENCY = "USD"
+# The paper account settles where the real one does: it only opens positions
+# quoted in this currency, so on a CAD account it buys the Toronto and Cboe
+# Canada lines the scan now keeps, and skips the US ones it could not hold
+# without an FX conversion this simulator does not model.
+ACCOUNT_CURRENCY = common.account_currency()
 
 AUTO_SELL_TRIGGERS = {"thesis_broken", "stop_loss", "thesis_completed"}
 EXIT_TRIGGER_PRIORITY = {

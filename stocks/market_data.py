@@ -752,6 +752,21 @@ _DROP_TOKENS = _LEGAL_SUFFIXES | _SHARE_NOISE
 _CLASS_RE = re.compile(r"\b(?:class|cl|series|ser)(?:\.\s*|\s+)[a-z0-9]{1,3}\b")
 _PARENS_RE = re.compile(r"\([^)]*\)")
 
+# A Canadian Depositary Receipt is not a different company from the one it is
+# a receipt for. "Apple Inc. CDR (CAD Hedged)" on Cboe Canada is Apple, bought
+# in Canadian dollars with the currency risk hedged out, and a Canadian account
+# holds it INSTEAD of AAPL rather than as well. Stripping the wrapper is what
+# lets the two group together, so the dedupe can then keep whichever listing
+# the account can actually trade - see dedupe_tickers(prefer_suffixes=...).
+# Without this they normalize to different names, both survive, and the same
+# company is scored, clustered and sized twice.
+_CDR_RE = re.compile(r"\b(?:canadian\s+depositary\s+receipts?|cdrs?)\b")
+# Currency-qualified ("CAD Hedged"), or trailing ("... Hedged"). A bare
+# "hedged" anywhere would eat the first word of "Hedged Fund Holdings Inc",
+# which is a real name and a different company from "Fund Holdings".
+_HEDGE_RE = re.compile(r"\b(?:cad|usd|c\$|us\$)\s*(?:un)?hedged\b"
+                       r"|\s(?:un)?hedged\s*$")
+
 
 def normalize_company_name(name: Optional[str]) -> str:
     """Reduce a company name to a comparison key.
@@ -765,6 +780,8 @@ def normalize_company_name(name: Optional[str]) -> str:
     text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
     text = _PARENS_RE.sub(" ", text)
     text = text.replace("&", " and ")
+    text = _CDR_RE.sub(" ", text)
+    text = _HEDGE_RE.sub(" ", text)
     text = _CLASS_RE.sub(" ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
 
@@ -780,17 +797,41 @@ def normalize_company_name(name: Optional[str]) -> str:
     return " ".join(trimmed or tokens)
 
 
+def _prefers(symbol: str, suffixes) -> bool:
+    """Whether a symbol is one of the listings the caller asked to keep.
+
+    "" in `suffixes` means a symbol with no exchange suffix - Yahoo's way of
+    writing a US listing.
+    """
+    for suffix in suffixes or ():
+        if suffix == "":
+            if "." not in symbol:
+                return True
+        elif symbol.endswith(suffix):
+            return True
+    return False
+
+
 def dedupe_tickers(ticker_list: Iterable[str],
                    ttl: float = TTL_FINANCIALS,
                    names: Optional[dict] = None,
-                   volumes: Optional[dict] = None) -> tuple:
+                   volumes: Optional[dict] = None,
+                   prefer_suffixes: Optional[Iterable[str]] = None) -> tuple:
     """Collapse tickers that are the same underlying company.
 
-    Dual-class listings (GOOGL/GOOG, BRK-A/BRK-B) and cross-listings
-    (SHOP/SHOP.TO) share a company name once normalized. Within a group the
-    ticker with the highest average daily volume is kept - ties break toward
-    the primary listing (no exchange suffix), then the shorter symbol, then
-    input order.
+    Dual-class listings (GOOGL/GOOG, BRK-A/BRK-B), cross-listings (SHOP/SHOP.TO)
+    and CDRs (AAPL/AAPL.NE) share a company name once normalized. Within a
+    group the ticker with the highest average daily volume is kept - ties break
+    toward the primary listing (no exchange suffix), then the shorter symbol,
+    then input order.
+
+    `prefer_suffixes` overrides that first test with the account's own reality:
+    pass stocks_common.preferred_suffixes("CAD") and a cross-listed name keeps
+    its Toronto or Cboe Canada line even though the US one trades many times
+    the volume. Volume decides only among the listings that clear the
+    preference, so it still breaks ties sensibly. Without it the most traded
+    listing wins, which for every cross-listed name is the US one - the right
+    answer for a US account and the wrong one for anybody else.
 
     Tickers whose name cannot be fetched are always kept: a network failure
     must never silently shrink the universe.
@@ -803,9 +844,10 @@ def dedupe_tickers(ticker_list: Iterable[str],
 
     Returns (deduped_list, dropped_list). deduped_list is the surviving
     tickers in input order; dropped_list holds dicts of
-    {ticker, kept, reason, name, normalized, avg_volume, kept_avg_volume}
-    so the caller can log exactly what went and why.
+    {ticker, kept, reason, decided_by, name, normalized, avg_volume,
+    kept_avg_volume} so the caller can log exactly what went and why.
     """
+    prefer = tuple(prefer_suffixes or ())
     ordered: list = []
     dropped: list = []
     seen: dict = {}
@@ -862,12 +904,20 @@ def dedupe_tickers(ticker_list: Iterable[str],
             group_volumes[symbol] = _num(volume) or 0.0
 
         def rank(symbol):
-            return (group_volumes[symbol],
+            return (1 if _prefers(symbol, prefer) else 0,
+                    group_volumes[symbol],
                     0 if "." not in symbol else -1,
                     -len(symbol),
                     -position[symbol])
 
         winner = max(members, key=rank)
+        # Whether the preference decided this group or volume did. Worth
+        # recording: "kept AAPL.NE over AAPL on 1/300th the volume" reads as a
+        # bug in the log until it says the account asked for it.
+        decided_by = ("listing preference"
+                      if prefer and _prefers(winner, prefer)
+                      and not all(_prefers(s, prefer) for s in members)
+                      else "volume")
         keep.add(winner)
         for symbol in members:
             if symbol == winner:
@@ -876,6 +926,7 @@ def dedupe_tickers(ticker_list: Iterable[str],
                 "ticker": symbol,
                 "kept": winner,
                 "reason": "duplicate_company",
+                "decided_by": decided_by,
                 "name": resolved_names.get(symbol),
                 "normalized": key,
                 "avg_volume": group_volumes.get(symbol),
@@ -905,6 +956,17 @@ _NAME_CASES = [
     ("Energy Fuels Inc.",               "energy fuels"),
     ("Cloud Peak Energy Inc.",          "cloud peak energy"),
     ("Clearway Energy, Inc. Cl. C",     "clearway energy"),
+    # CDRs: the wrapper is not a different company from what it wraps.
+    ("Apple Inc. CDR (CAD Hedged)",     "apple"),
+    ("Apple Inc.",                      "apple"),
+    ("Alphabet Inc. CDR (CAD Hedged)",  "alphabet"),
+    ("Amazon.com Inc CDR",              "amazon"),
+    ("Amazon.com, Inc.",                "amazon"),
+    # ...but a company that is simply CALLED that keeps its name.
+    ("Hedged Fund Holdings Inc",        "hedged fund holdings"),
+    ("Berkshire Hathaway Inc. Canadian Depositary Receipts (CAD Hedged)",
+                                        "berkshire hathaway"),
+    ("Shopify Inc. CDR CAD Hedged",     "shopify"),
     ("",                               ""),
 ]
 

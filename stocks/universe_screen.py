@@ -21,6 +21,11 @@ How the pull is shaped:
     tickers: with Canada included those numbers are in mixed currencies.
     Rows are tagged with their currency and passed through; normalization is
     a downstream problem. Sorting is alphabetical by ticker throughout.
+  - The account decides the shape of the net. With STOCKS_ACCOUNT_CURRENCY=CAD
+    the Canadian region is screened by default, and a company that trades in
+    both places keeps its Canadian line - Toronto, or the Cboe Canada CDR that
+    holds the US company hedged into CAD - because that is the one a Canadian
+    account can actually buy. Every part of that is overridable by flag.
 
 Output: <stocks>\data\candidates.json (see write_candidates for the schema).
 An empty result set is written like any other - no matches is a legitimate
@@ -37,6 +42,8 @@ Setup:
 Usage:
     py universe_screen.py                     # US, default thresholds
     py universe_screen.py --include-canada
+    set STOCKS_ACCOUNT_CURRENCY=CAD           # Canada in, Canadian line kept
+    set STOCKS_EXTRA_TICKERS=AAPL.NE,MSFT.NE  # CDRs the screen cannot answer on
     py universe_screen.py --min-volume 500000 --min-market-cap 1e9
     py universe_screen.py --sector Technology --sector Energy -v
 """
@@ -67,7 +74,10 @@ from yfinance import EquityQuery   # query construction only - no network here
 # Bump when this stage would produce a different answer from the same
 # inputs - scan_report re-runs it when the stamp on its output does not
 # match. See stocks_common.LOGIC_VERSION_KEY.
-SCREEN_VERSION = "1.0"
+# 1.1: the region, the cross-listing preference and the extra-ticker list all
+# follow the account's currency now, so the same thresholds can produce a
+# different universe than they did under the US-only defaults.
+SCREEN_VERSION = "1.1"
 
 # Sits next to market_data.py, so C:\Users\joey\stocks\data\candidates.json.
 DATA_DIR = common.data_dir(md.BASE_DIR)
@@ -97,9 +107,21 @@ PAGE_SIZE = md.SCREEN_PAGE_MAX         # 250, Yahoo's per-call cap
 DEFAULT_MAX_PAGES = 8                  # 2000 rows per partition, then stop
 REQUEST_PAUSE = 0.25                   # polite gap between real (uncached) pages
 
-# Yahoo region codes. US only unless --include-canada.
+# Yahoo region codes. US only unless --include-canada, which a CAD account
+# gets by default: a Canadian account that cannot see Canadian listings is
+# screening a market it does not trade in.
 REGION_US = "us"
 REGION_CA = "ca"
+
+# Listings a run keeps when the same company trades in several places. Read
+# from the account currency, so a CAD account keeps SHOP.TO over SHOP and the
+# CDR line (AAPL.NE) over AAPL - the CAD-hedged receipt being the thing it can
+# actually buy. --prefer-listing overrides it.
+LISTING_PREFERENCES = {
+    "ca": common.CAD_SUFFIXES,
+    "us": ("",),
+    "volume": (),          # no preference: the most traded listing wins
+}
 
 # Fallback if yfinance stops exposing its sector vocabulary.
 FALLBACK_SECTORS = [
@@ -109,7 +131,22 @@ FALLBACK_SECTORS = [
 ]
 
 # Suffix -> currency, used only when Yahoo omits the currency field.
-_SUFFIX_CURRENCY = {".TO": "CAD", ".V": "CAD", ".CN": "CAD", ".NE": "CAD"}
+_SUFFIX_CURRENCY = {suffix: "CAD" for suffix in common.CAD_SUFFIXES}
+
+
+def extra_tickers_from_env() -> list:
+    """$STOCKS_EXTRA_TICKERS, comma or space separated. [] when unset.
+
+    An escape hatch for names the screener will not return however wide the
+    net is opened. The CDRs are the case it was written for: Yahoo carries
+    AAPL.NE, but its screener answers on the fields it has for a listing, and
+    a depositary receipt can come back with no market cap at all - which the
+    market-cap floor then drops. A ticker named here joins the universe
+    regardless, and is tagged so the output says it was not screened in.
+    """
+    raw = os.environ.get("STOCKS_EXTRA_TICKERS") or ""
+    return [part.strip().upper() for part in raw.replace(",", " ").split()
+            if part.strip()]
 
 
 def yahoo_sectors() -> list:
@@ -307,14 +344,27 @@ def avg_volume_of(quote: dict) -> Optional[float]:
     return None
 
 
-def to_candidate(symbol: str, quote: dict, sector: Optional[str]) -> dict:
-    return {
+def to_candidate(symbol: str, quote: dict, sector: Optional[str],
+                 alternates: Optional[list] = None) -> dict:
+    row = {
         "ticker": symbol,
         "sector": sector or quote.get("sector") or None,
         "market_cap": _num(quote.get("marketCap")),
         "currency": currency_of(symbol, quote),
         "avg_volume": avg_volume_of(quote),
     }
+    # Named on the command line rather than returned by the screen. Recorded
+    # so nothing downstream reads a null market cap as "screened in and tiny".
+    if quote.get("_extra_ticker"):
+        row["screened"] = False
+    # The same company's other listings, which this one was kept over. Carried
+    # because a preferred listing is not always the scoreable one: Yahoo
+    # publishes no annual statements for most CDRs, and Stage 1 skipping
+    # AAPL.NE for want of them would otherwise make Apple disappear from the
+    # scan with nothing saying why.
+    if alternates:
+        row["alternates"] = sorted(alternates)
+    return row
 
 
 # Fraction of partitions that may fail before the run is judged a fetch
@@ -388,8 +438,24 @@ def write_candidates(candidates: list,
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Stage 0: pull a loose candidate universe into data/candidates.json")
-    parser.add_argument("--include-canada", action="store_true",
-                        help="also screen Canadian listings (tagged CAD)")
+    parser.add_argument("--include-canada", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="also screen Canadian listings (tagged CAD). Default: "
+                             "on when $STOCKS_ACCOUNT_CURRENCY is CAD, off otherwise")
+    parser.add_argument("--prefer-listing", choices=sorted(LISTING_PREFERENCES),
+                        default=None, metavar="WHICH",
+                        help="which listing to keep when one company trades in "
+                             "several places: ca (Toronto/Venture/CSE/Cboe Canada, "
+                             "including the CDRs), us, or volume (the most traded, "
+                             "which is always the US line). Default: ca for a CAD "
+                             "account, volume otherwise")
+    parser.add_argument("--extra-ticker", action="append", dest="extra_tickers",
+                        metavar="SYMBOL",
+                        help="include this symbol whatever the screen returns "
+                             "(repeatable; $STOCKS_EXTRA_TICKERS adds more). For "
+                             "names the screener cannot answer on - a CDR with no "
+                             "market cap of its own, say. Costs one cached info "
+                             "request each, to find the company behind the symbol")
     parser.add_argument("--max-pe", type=float, default=DEFAULT_MAX_PE,
                         help="optional trailing P/E ceiling (default: none - see the "
                              "note in CONFIG for why Stage 0 does not filter on P/E)")
@@ -431,7 +497,17 @@ def main(argv=None) -> int:
     if args.verbose:
         md.DEBUG = True
 
-    regions = [REGION_US] + ([REGION_CA] if args.include_canada else [])
+    # The account decides the shape of the net unless a flag says otherwise.
+    currency = common.account_currency()
+    include_canada = (args.include_canada if args.include_canada is not None
+                      else currency == "CAD")
+    preference = args.prefer_listing or ("ca" if currency == "CAD" else "volume")
+    prefer_suffixes = LISTING_PREFERENCES[preference]
+    extras = sorted(set(args.extra_tickers or [])
+                    | set(extra_tickers_from_env()))
+    extras = [str(symbol).strip().upper() for symbol in extras if str(symbol).strip()]
+
+    regions = [REGION_US] + ([REGION_CA] if include_canada else [])
 
     if args.no_sector_split:
         sectors = [None]
@@ -460,7 +536,11 @@ def main(argv=None) -> int:
         return "" if value is None else f", {label} {value:{fmt}}"
 
     print("== universe screen (stage 0) ==")
+    print(f"account:  {currency}  ·  keep the {preference} listing of a "
+          f"cross-listed name")
     print(f"regions:  {', '.join(regions)}")
+    if extras:
+        print(f"extra:    {', '.join(extras)} (added whatever the screen returns)")
     print("filters: " + ("  (none)" if not any(params[k] is not None for k in
           ("max_pe", "min_pe", "min_avg_volume", "min_market_cap")) else
           (_threshold("P/E <", params["max_pe"], "g")
@@ -473,6 +553,13 @@ def main(argv=None) -> int:
     rows_by_symbol, stats = run_screen(params, regions, sectors,
                                        max_pages=args.max_pages,
                                        force_refresh=args.refresh)
+
+    # Extras join before the dedupe, so a CDR named here is grouped with its
+    # underlying and the listing preference then decides which of the two
+    # survives - the whole point of naming it.
+    for symbol in extras:
+        rows_by_symbol.setdefault(symbol, ({"symbol": symbol,
+                                            "_extra_ticker": True}, None))
 
     symbols = sorted(rows_by_symbol)   # alphabetical: never ordered by money
     dropped: list = []
@@ -491,9 +578,15 @@ def main(argv=None) -> int:
             volume = avg_volume_of(quote)
             if volume is not None:
                 volumes[symbol] = volume
-        kept, dropped = md.dedupe_tickers(symbols, names=names, volumes=volumes)
+        kept, dropped = md.dedupe_tickers(symbols, names=names, volumes=volumes,
+                                          prefer_suffixes=prefer_suffixes)
 
-    candidates = [to_candidate(symbol, *rows_by_symbol[symbol]) for symbol in kept]
+    alternates_of: dict = {}
+    for row in dropped:
+        alternates_of.setdefault(row["kept"], []).append(row["ticker"])
+    candidates = [to_candidate(symbol, *rows_by_symbol[symbol],
+                               alternates=alternates_of.get(symbol))
+                  for symbol in kept]
 
     if dropped:
         print(f"\ndedupe dropped {len(dropped)}:")
@@ -502,8 +595,10 @@ def main(argv=None) -> int:
             detail = ""
             if volume and kept_volume:
                 detail = f", vol {volume:,.0f} vs {kept_volume:,.0f}"
+            decided = row.get("decided_by")
+            decided = f", by {decided}" if decided else ""
             print(f"  {row['ticker']:<10} -> kept {row['kept']:<10} "
-                  f"({row['reason']}{detail}) {row.get('name') or ''}")
+                  f"({row['reason']}{decided}{detail}) {row.get('name') or ''}")
 
     query_params = {
         "max_pe": params["max_pe"],
@@ -512,7 +607,10 @@ def main(argv=None) -> int:
         "min_market_cap": params["min_market_cap"],
         "market_cap_note": "threshold applies in each listing's own currency; not normalized",
         "regions": regions,
-        "include_canada": bool(args.include_canada),
+        "include_canada": bool(include_canada),
+        "account_currency": currency,
+        "prefer_listing": preference,
+        "extra_tickers": extras or None,
         "sectors": sectors if sectors != [None] else None,
         "sector_split": not args.no_sector_split,
         "page_size": PAGE_SIZE,

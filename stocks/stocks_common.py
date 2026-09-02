@@ -16,6 +16,9 @@ market_data.py can build on it rather than the other way round.
 
     BASE_DIR                     the folder holding these scripts
     data_dir()                   <base>\data, honouring $STOCKS_DATA_DIR
+    account_currency()           what the account settles in ($STOCKS_ACCOUNT_CURRENCY)
+    preferred_suffixes()         which listing that currency would rather hold
+    is_cad_listing(ticker)       whether a symbol is a Canadian listing
     add_project_dir_to_path()    make the sibling modules importable
     num(value)                   float, or None for None/NaN/non-numeric
     read_json(path)              parsed JSON, or None - never raises
@@ -45,6 +48,55 @@ from typing import Any, Callable, Optional
 # exports this as market_data.BASE_DIR, which is the name the rest of the
 # project and stock_view already ask for.
 BASE_DIR = Path(os.environ.get("STOCKS_DIR") or Path(__file__).resolve().parent)
+
+
+# ─── WHERE THE ACCOUNT SETTLES ─────────────────────────────────────────────
+# Every stage that compares money to money needs to know this, and until it was
+# named here each one simply assumed USD: the screener pulled US listings only,
+# the liquidity gate converted into USD, the dedupe kept whichever listing
+# traded most (always the US one for a cross-listed name), and the paper
+# simulator refused to buy anything quoted in anything else.
+#
+# Set STOCKS_ACCOUNT_CURRENCY=CAD once and those defaults follow the account
+# instead. Every one of them still takes an explicit flag that wins over this.
+DEFAULT_ACCOUNT_CURRENCY = "USD"
+
+# Yahoo's suffixes for the Canadian venues: Toronto, TSX Venture, the CSE, and
+# Cboe Canada - which is where the CDRs trade, the CAD-hedged depositary
+# receipts over US megacaps that a Canadian account buys instead of the US line.
+CAD_SUFFIXES = (".TO", ".V", ".CN", ".NE")
+
+# Which listing an account in a given currency would rather hold. "" means a
+# symbol with no suffix at all, which is how Yahoo writes a US listing.
+PREFERRED_SUFFIXES = {
+    "CAD": CAD_SUFFIXES,
+    "USD": ("",),
+}
+
+
+def account_currency(default: Optional[str] = None) -> str:
+    """The currency the account settles in. $STOCKS_ACCOUNT_CURRENCY, else USD."""
+    value = os.environ.get("STOCKS_ACCOUNT_CURRENCY")
+    if value and value.strip():
+        return value.strip().upper()
+    return (default or DEFAULT_ACCOUNT_CURRENCY).upper()
+
+
+def preferred_suffixes(currency: Optional[str] = None) -> tuple:
+    """The listing suffixes an account in this currency should keep. () if unknown.
+
+    An empty tuple rather than a guess matters: with no preference the dedupe
+    falls back to keeping the most traded listing, which is a defensible answer
+    for a currency nothing here knows about. A wrong preference silently drops
+    the listing the person can actually buy.
+    """
+    return PREFERRED_SUFFIXES.get((currency or account_currency()).upper(), ())
+
+
+def is_cad_listing(ticker: Optional[str]) -> bool:
+    """True for a Toronto / Venture / CSE / Cboe Canada symbol."""
+    symbol = str(ticker or "").strip().upper()
+    return any(symbol.endswith(suffix) for suffix in CAD_SUFFIXES)
 
 
 def data_dir(base: Optional[Path] = None) -> Path:

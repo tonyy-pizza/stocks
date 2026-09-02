@@ -1435,10 +1435,12 @@ def main(argv=None):
                         help="cap how many screened candidates get scored")
     parser.add_argument("--account-size", type=float, metavar="AMOUNT",
                         help="account size for the evaluator's liquidity gate")
-    parser.add_argument("--account-currency", default="USD", metavar="CODE",
-                        help="currency the account size is in (default USD). The "
-                             "liquidity gate converts each name's dollar volume "
-                             "into this before comparing.")
+    parser.add_argument("--account-currency", default=common.account_currency(),
+                        metavar="CODE",
+                        help="currency the account size is in (default "
+                             "$STOCKS_ACCOUNT_CURRENCY, else USD). The liquidity "
+                             "gate converts each name's dollar volume into this "
+                             "before comparing.")
     parser.add_argument("--top", type=int, metavar="N",
                         help="shortlist size for clustering and sizing")
     parser.add_argument("--min-composite", type=float, metavar="SCORE")
