@@ -54,7 +54,8 @@ DISCLAIMER = "⚠ For informational use only. Not financial advice."
 def sidebar(scan):
     """Where the data came from, how old it is, and the reload button."""
     st.sidebar.title("stock_view")
-    st.sidebar.caption("A read-only view over the scan pipeline's output.")
+    st.sidebar.caption("A read-only view over the scan pipeline's output. The one "
+                       "file it writes is holdings.json, from the Holdings tab.")
 
     view = st.sidebar.radio("View", list(VIEWS), key="view")
     st.sidebar.divider()
@@ -152,13 +153,16 @@ def main():
     view = sidebar(scan)
 
     # holdings.json is hand-edited and exists independently of any scan, so the
-    # holdings view is worth showing even before the first one has run.
+    # holdings view is worth showing even before the first one has run - and now
+    # even before the file itself exists, because its Edit tab is where a person
+    # with a fresh install creates it.
     if not scan.any_data:
-        if view == "Holdings" and scan.holdings.exists:
+        if view == "Holdings":
             holdings.render(scan)
             st.divider()
             st.caption(f"No scan data in `{scan.directory}` yet — run "
-                       f"`py scan_report.py` for the other views.")
+                       f"`py scan_report.py` for the other views. Holdings works "
+                       f"without it: the file it reads is yours, not the scan's.")
             return
         no_data_yet(scan)
         return

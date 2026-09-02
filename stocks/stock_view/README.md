@@ -96,7 +96,7 @@ what to run, rather than an error.
 | **Cluster explorer** | The clusters from `clustered.json`, which is richer than the trimmed `cluster` field on each candidate: members, average correlation, dispersion, eigenvalue, share of variance, the resolution and why it resolved that way, plus the winner and its demoted peers. Each cluster gets a correlation heatmap. |
 | **Position sizing simulator** | The core view. Move the correlation threshold, reduction factor, basis (raw/cleaned) and reduction mode (proportional/flat), and every not-yet-held candidate is re-sized live. Select a handful of names for a rollup: combined allocation, sector concentration, and which holdings are taking the most size out of the selection. |
 | **Ticker drill-down** | The full blob behind one name — every metric group, Piotroski, Altman Z, Graham, Magic Formula, the DCF scenarios, the value screen, insider activity, warnings and notes. Plus the optional price sparkline. |
-| **Holdings** | `holdings.json` as a table, with book value totalled **per currency**, and the exit review `position_sizer.py` runs over each holding — now including its ROA trend and data coverage. Read-only. |
+| **Holdings** | Two tabs. **Positions**: `holdings.json` as a table, with book value totalled **per currency**, and the exit review `position_sizer.py` runs over each holding — including its ROA trend and data coverage. **Edit**: the same file as an editable table — add, change and delete positions, with current price and P&L beside them, validated and written on an explicit save (previous file kept as `holdings.json.bak`). |
 
 It also reads two files it does not put in a view: `candidates.json`, for
 whether Stage 0's universe came back whole, and `run_status.json`, for whether
@@ -202,9 +202,14 @@ relationship the sizing simulator actually acts on.
 - **Never writes** to `sized_candidates.json`, `clustered.json` or
   `scored_candidates.json`. Those are pipeline outputs and are treated as
   read-only.
-- **Never writes** to `holdings.json` either. It is the one canonical file the
-  rest of the pipeline reads, so v1 displays it and no more — edit it directly
-  and re-run the scan. Each entry takes an optional `"currency"`, and when it
+- **Writes exactly one file**, and only from the Holdings → Edit tab:
+  `holdings.json`, the hand-maintained input `position_sizer.py` and
+  `holdings_exit.py` read. Nothing is written until you press **Save changes**,
+  the table is validated first (no duplicate tickers, positive numbers, a real
+  entry date that is not in the future), and the previous file is copied to
+  `holdings.json.bak` before the new one lands. `paper_portfolio.json` belongs
+  to `paper_sim.py`'s separate simulated track and is never touched.
+  Each entry takes an optional `"currency"`, and when it
   is there it wins: you know what you paid in better than any inference does.
   Without it the currency comes from the scan's `quote_currency`, then from a
   `.TO`/`.V`/`.CN`/`.NE` suffix, and stays *unknown* rather than being guessed
