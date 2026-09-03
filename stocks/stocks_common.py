@@ -40,6 +40,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -204,6 +205,28 @@ def output_logic_version(path) -> Optional[str]:
     return None if version is None else str(version)
 
 
+# Windows refuses os.replace with "Access is denied" while anything else holds
+# either file open, and something usually does for a moment: a real-time
+# antivirus scanner opens every file the instant it is created, and OneDrive
+# does the same. The hold is milliseconds, so a few short retries turn a failed
+# cache write - and with it a refetch, and with enough of those a rate limit -
+# back into a write that simply happened a moment later. POSIX never takes this
+# path.
+_REPLACE_ATTEMPTS = 4
+_REPLACE_DELAY = 0.1
+
+
+def _replace_with_retry(tmp_path, output_path) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp_path, output_path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY * (2 ** attempt))
+
+
 def write_json(document: Any,
                output_path,
                default: Optional[Callable[[Any], Any]] = None,
@@ -224,7 +247,7 @@ def write_json(document: Any,
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=indent, ensure_ascii=False, default=default)
-        os.replace(tmp_path, output_path)
+        _replace_with_retry(tmp_path, output_path)
     except Exception:
         try:
             os.unlink(tmp_path)

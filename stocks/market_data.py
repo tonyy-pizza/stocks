@@ -260,18 +260,36 @@ def _entry_age(entry: Optional[dict]) -> Optional[float]:
     return (dt.datetime.now() - stamp).total_seconds()
 
 
+# Cache writes that failed in this process. Counted rather than announced one
+# by one: the failure is the same failure every time, and a few hundred copies
+# of it is what buries the run's actual output.
+_CACHE_WRITE_FAILURES = 0
+
+
 def _write_cache_entry(path: Path, data: Any) -> None:
     """Atomic write so a killed run never leaves a half-written cache file.
 
     A cache write that fails is a warning, not an error: the value was already
     fetched and returned, and the only cost of not storing it is fetching it
-    again next time.
+    again next time. That cost compounds, though - nothing cached means
+    everything refetched, which is how a run talks itself into a rate limit -
+    so the first failure says what usually causes it.
     """
+    global _CACHE_WRITE_FAILURES
     entry = {"timestamp": dt.datetime.now().isoformat(timespec="seconds"), "data": data}
     try:
         common.write_json(entry, path, default=_json_default)
     except Exception as e:
-        _warn(f"could not write cache {path.name}: {e}")
+        _CACHE_WRITE_FAILURES += 1
+        if _CACHE_WRITE_FAILURES == 1:
+            _warn(f"could not write cache {path.name}: {e}")
+            _warn(f"nothing is being cached, so every value will be refetched - "
+                  f"which is what gets a run rate-limited. On Windows this is "
+                  f"almost always antivirus or a sync client (OneDrive, Dropbox) "
+                  f"holding the file open: exclude {CACHE_DIR}, or point "
+                  f"STOCKS_CACHE_DIR somewhere outside the synced folder.")
+        elif _CACHE_WRITE_FAILURES % 50 == 0:
+            _warn(f"{_CACHE_WRITE_FAILURES} cache writes have failed now")
 
 
 def cached_fetch(cache_key: str,
@@ -375,6 +393,33 @@ def _status_code(exc: Exception) -> Optional[int]:
     return code if isinstance(code, int) else None
 
 
+class NoData(ValueError):
+    """Yahoo answered, and the answer was nothing.
+
+    A delisted ticker, a company that files no annual statements, a price
+    history with no rows. Retrying cannot change any of those, and a universe
+    screen turns up dozens of them every run - so four attempts each, fourteen
+    seconds apart, spends a request budget on findings that were already
+    final. Spending it is not free: running out of budget is what produces the
+    429s further down the same log.
+
+    Raised only where the payload came back parseable and empty. A fetch that
+    could not be made raises whatever the transport raised, and that is still
+    retried.
+    """
+
+
+# When Yahoo last refused a request in this process. An empty payload while
+# the endpoint is throttling us is not evidence that the data does not exist,
+# so NoData is retried inside this window and taken at face value outside it.
+_LAST_RATE_LIMIT = 0.0
+RATE_LIMIT_SUSPICION_WINDOW = 120.0
+
+
+def _recently_rate_limited() -> bool:
+    return (time.monotonic() - _LAST_RATE_LIMIT) < RATE_LIMIT_SUSPICION_WINDOW
+
+
 def _looks_rate_limited(exc: Exception) -> bool:
     if _status_code(exc) == 429:
         return True
@@ -413,11 +458,26 @@ def fetch_with_backoff(fetch_fn: Callable[..., Any],
     After the last failure it returns None rather than raising - callers
     must handle None. Only Exception is caught, so Ctrl-C still interrupts.
     """
+    global _LAST_RATE_LIMIT
     last_error: Optional[Exception] = None
 
     for attempt in range(max_retries):
         try:
             return fetch_fn(*args, **kwargs)
+        except NoData as e:
+            # Nothing to retry, unless the endpoint is currently refusing us -
+            # then an empty payload is suspect and worth asking again.
+            if not _recently_rate_limited():
+                _log(f"no data: {e}")
+                return None
+            last_error = e
+            if attempt >= max_retries - 1:
+                break
+            delay = base_delay * (2 ** attempt) + random.uniform(0, min(1.0, base_delay))
+            _log(f"attempt {attempt + 1}/{max_retries} came back empty while rate "
+                 f"limited ({e}); retrying in {delay:.1f}s")
+            time.sleep(delay)
+            continue
         except Exception as e:
             last_error = e
             if attempt >= max_retries - 1:
@@ -425,6 +485,7 @@ def fetch_with_backoff(fetch_fn: Callable[..., Any],
 
             delay = base_delay * (2 ** attempt)
             if _looks_rate_limited(e):
+                _LAST_RATE_LIMIT = time.monotonic()
                 delay *= 2
             retry_after = _retry_after_seconds(e)
             if retry_after is not None:
@@ -434,7 +495,12 @@ def fetch_with_backoff(fetch_fn: Callable[..., Any],
             _log(f"attempt {attempt + 1}/{max_retries} failed ({e}); retrying in {delay:.1f}s")
             time.sleep(delay)
 
-    _warn(f"giving up after {max_retries} attempts: {last_error}")
+    if isinstance(last_error, NoData):
+        _log(f"no data after {max_retries} attempts: {last_error}")
+    else:
+        if _looks_rate_limited(last_error):
+            _LAST_RATE_LIMIT = time.monotonic()
+        _warn(f"giving up after {max_retries} attempts: {last_error}")
     return None
 
 
@@ -447,7 +513,7 @@ def get_info(ticker: str, ttl: float = TTL_FINANCIALS, force_refresh: bool = Fal
     def _fetch():
         info = get_ticker(ticker).info
         if not info:
-            raise ValueError(f"empty info payload for {ticker}")
+            raise NoData(f"empty info payload for {ticker}")
         return info
 
     return cached_fetch(f"{ticker}_info",
@@ -487,7 +553,7 @@ def get_price_history(ticker: str,
     def _fetch():
         hist = get_ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
         if hist is None or hist.empty:
-            raise ValueError(f"empty price history for {ticker} ({period}/{interval})")
+            raise NoData(f"empty price history for {ticker} ({period}/{interval})")
         return _history_to_rows(hist)
 
     return cached_fetch(f"{ticker}_{period}_{interval}",
@@ -565,10 +631,10 @@ def download_prices(tickers,
                                 group_by="column", threads=True,
                                 session=get_session())
             if frame is None or frame.empty:
-                raise ValueError(f"empty download for {len(chunk)} tickers ({period})")
+                raise NoData(f"empty download for {len(chunk)} tickers ({period})")
             closes = _close_frame(frame, chunk)
             if closes is None or closes.empty:
-                raise ValueError(f"no Close column for {len(chunk)} tickers ({period})")
+                raise NoData(f"no Close column for {len(chunk)} tickers ({period})")
             dates = [d.strftime("%Y-%m-%d") for d in closes.index]
             payload = {}
             for symbol in closes.columns:
@@ -578,7 +644,7 @@ def download_prices(tickers,
                 if rows:
                     payload[str(symbol).upper()] = rows
             if not payload:
-                raise ValueError(f"no usable closes for {len(chunk)} tickers ({period})")
+                raise NoData(f"no usable closes for {len(chunk)} tickers ({period})")
             return payload
 
         result = cached_fetch(key, lambda: fetch_with_backoff(_pull), ttl,

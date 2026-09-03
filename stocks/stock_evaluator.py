@@ -1928,7 +1928,7 @@ def fetch_statements(ticker, ttl=None, force_refresh=False):
                    "bal": _frame_to_payload(t.balance_sheet),
                    "cf":  _frame_to_payload(t.cashflow)}
         if all(v is None for v in payload.values()):
-            raise ValueError(f"no annual statements returned for {ticker}")
+            raise md.NoData(f"no annual statements returned for {ticker}")
         return payload
 
     return md.cached_fetch(f"{ticker}_statements",
@@ -1945,7 +1945,7 @@ def fetch_insider(ticker, ttl=None, force_refresh=False):
         table = md.get_ticker(ticker).insider_purchases
         payload = _frame_to_payload(table)
         if payload is None:
-            raise ValueError(f"no insider table for {ticker}")
+            raise md.NoData(f"no insider table for {ticker}")
         return payload
 
     return md.cached_fetch(f"{ticker}_insider",

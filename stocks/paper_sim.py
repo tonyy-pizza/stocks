@@ -1016,8 +1016,14 @@ def main(argv=None) -> int:
     parser.add_argument("--sentiment-top", type=int,
                         default=scan_report.SENTIMENT_TOP, metavar="N")
     parser.add_argument("--workers", type=int, metavar="N")
+    parser.add_argument("--quiet", action="store_true",
+                        help="hide the scan's stage progress. market_data's own "
+                             "warnings go to stderr and print either way")
+    # Kept so an old command line still runs. Progress is the default now: with
+    # it off, the only thing a first run put on screen was market_data's
+    # warnings, which made a working run look like nothing but errors.
     parser.add_argument("--show-progress", action="store_true",
-                        help="show the existing scan stages while they run")
+                        help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     result = run_paper_cycle(
@@ -1033,7 +1039,7 @@ def main(argv=None) -> int:
         min_composite=args.min_composite,
         sentiment_top=args.sentiment_top,
         workers=args.workers,
-        quiet=not args.show_progress,
+        quiet=args.quiet,
     )
 
     equity = "unavailable" if result["total_equity"] is None else f"${result['total_equity']:,.2f}"
